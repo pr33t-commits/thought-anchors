@@ -8,7 +8,7 @@ load_dotenv()
 bridge = TransformerBridge.boot_transformers(
     "deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B",
     # token=HF_KEY,
-    device="cpu",  # or "cpu"
+    device="auto",  # or "cpu"
     # dtype="float32",
     trust_remote_code=False,  # Usually not needed for official models
 )
