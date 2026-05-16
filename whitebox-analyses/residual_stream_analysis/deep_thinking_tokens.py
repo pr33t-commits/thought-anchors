@@ -177,6 +177,10 @@ def main():
     # Analyze residual stream importance using various methods
     importance_results = analyze_residual_stream(bridge, chunk_outputs)
 
+    results_dir = "Results"
+    os.makedir(results_dir, exist_ok = True)
+    with open(os.path.join(results_dir,"deep_thinking_tokens_distances"), 'w', encoding='utf-8') as f:
+        json.dump(importance_results, f, indent=2)
     # print(importance_results["1923"][3].keys())
     # Save results
     # save_importance_results(importance_results, output_dir)
