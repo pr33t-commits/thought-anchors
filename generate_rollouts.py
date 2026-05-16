@@ -23,10 +23,12 @@ TOGETHER_API_KEY = os.getenv("TOGETHER_API_KEY")
 FIREWORKS_API_KEY = os.getenv("FIREWORKS_API_KEY")
 HF_KEY = os.getenv("HF_TOKEN")
 
+# "deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B"
+
 # Set up argument parser
 import argparse
 parser = argparse.ArgumentParser(description='Generate chain-of-thought solutions with rollouts')
-parser.add_argument('-m', '--model', type=str, default=None, help='Model to use') # "deepseek/deepseek-r1-distill-llama-8b" accounts/fireworks/models/deepseek-r1-distill-qwen-14b #deepseek-ai/DeepSeek-R1-Distill-Qwen-14B
+parser.add_argument('-m', '--model', type=str, default="accounts/pdlodaya-l7vcn0oxxgj/deployments/e2zlc2rg", help='Model to use') # "deepseek/deepseek-r1-distill-llama-8b" accounts/fireworks/models/deepseek-r1-distill-qwen-14b #deepseek-ai/DeepSeek-R1-Distill-Qwen-14B
 parser.add_argument('-b', '--base_solution_type', type=str, default='correct', choices=['correct', 'incorrect'], help='Type of base solution to generate')
 parser.add_argument('-r', '--rollout_type', type=str, default='default', choices=['default', 'forced_answer'], help='Type of rollout to generate')
 parser.add_argument('-o', '--output_dir', type=str, default='math_rollouts', help='Directory to save results')
@@ -37,14 +39,14 @@ parser.add_argument('-tp', '--top_p', type=float, default=0.95, help='Top-p samp
 parser.add_argument('-mt', '--max_tokens', type=int, default=16384, help='Maximum number of tokens for generation')
 parser.add_argument('-mc', '--max_chunks', type=int, default=275, help='Maximum number of chunks to process')
 parser.add_argument('-s', '--seed', type=int, default=44, help='Random seed for reproducibility')
-parser.add_argument('-f', '--force', action='store_true', help='Force regeneration even if solutions exist')
+parser.add_argument('-f', '--force', default=False, action='store_true', help='Force regeneration even if solutions exist')
 parser.add_argument('-ep', '--exclude_problems', type=str, default=None, help='Comma-separated list of problem IDs to exclude')
 parser.add_argument('-ip', '--include_problems', type=str, default=None, help='Comma-separated list of problem IDs to include')
 parser.add_argument('-ic', '--include_chunks', type=str, default=None, help='Comma-separated list of chunk IDs to include')
 parser.add_argument('-ty', '--type', type=str, default=None, help='Problem type filter')
 parser.add_argument('-l', '--level', type=str, default="Level 5", help='Problem level filter')
 parser.add_argument('-sp', '--split', type=str, default='train', choices=['train', 'test'], help='Dataset split to use')
-parser.add_argument('-p', '--provider', type=str, default="Novita", choices=['Novita', 'Together', 'Fireworks', 'OpenRouter','Local'], help='Provider to use') # "Together"
+parser.add_argument('-p', '--provider', type=str, default="Fireworks", choices=['Novita', 'Together', 'Fireworks', 'OpenRouter','Local'], help='Provider to use') # "Together"
 parser.add_argument('-or', '--use_openrouter', default=False, action='store_true', help='Use OpenRouter API')
 parser.add_argument('-fp', '--frequency_penalty', type=float, default=None, help='Frequency penalty parameter')
 parser.add_argument('-pp', '--presence_penalty', type=float, default=None, help='Presence penalty parameter')
@@ -56,6 +58,7 @@ parser.add_argument('-q', '--quantize', default=False, action='store_true', help
 parser.add_argument('-bs', '--batch_size', type=int, default=8, help='Batch size for local model')
 parser.add_argument('-mr', '--max_retries', type=int, default=1, help='Maximum number of retries for API requests')
 parser.add_argument('-os', '--output_suffix', type=str, default=None, help='Suffix to add to the output directory')
+
 args = parser.parse_args()
 
 # Create output directory
@@ -240,7 +243,7 @@ def generate_with_local_model_batch(prompts: List[str], temperature: float, top_
         print(f"Error in batch generation: {e}")
         return [{"error": str(e)} for _ in range(len(prompts))]
 
-async def make_api_request(prompt: str, temperature: float, top_p: float, max_tokens: int) -> Dict:
+async def make_api_request(prompt_dict: Dict, temperature: float, top_p: float, max_tokens: int) -> Dict:
     """Make an API request to either Novita, Together, Fireworks, or use a local model based on provider setting."""
     # If using local model, use synchronous generation
     if args.provider == "Local":
@@ -256,7 +259,7 @@ async def make_api_request(prompt: str, temperature: float, top_p: float, max_to
         
         payload = {
             "model": args.model,
-            "prompt": prompt,
+            # "prompt": prompt,
             "temperature": temperature,
             "top_p": top_p,
             "max_tokens": max_tokens,
@@ -264,7 +267,7 @@ async def make_api_request(prompt: str, temperature: float, top_p: float, max_to
             "stream": False
         }
         
-        api_url = "https://api.novita.ai/dedicated/v1/openai/completions"#"https://api.novita.ai/dedicated/v1/openai/completions"#"https://api.novita.ai/v3/openai/completions"
+        api_url = "https://api.novita.ai/dedicated/v1/openai"#"https://api.novita.ai/dedicated/v1/openai/completions"#"https://api.novita.ai/v3/openai/completions"
         
     elif args.provider == "Together":
         # Together API request
@@ -276,7 +279,7 @@ async def make_api_request(prompt: str, temperature: float, top_p: float, max_to
         
         payload = {
             "model": args.model if args.model else "deepseek-ai/deepseek-r1-distill-qwen-14b",
-            "prompt": prompt,
+            # "prompt": prompt,
             "temperature": temperature,
             "top_p": top_p,
             "max_tokens": max_tokens,
@@ -293,8 +296,8 @@ async def make_api_request(prompt: str, temperature: float, top_p: float, max_to
         }
         
         payload = {
-            "model": "fireworks/deepseek-r1-distill-qwen-14b",
-            "prompt": prompt,
+            "model": args.model,#"fireworks/deepseek-r1-distill-qwen-14b",
+            # "prompt": prompt,
             "temperature": temperature,
             "top_p": top_p,
             "max_tokens": max_tokens,
@@ -302,7 +305,7 @@ async def make_api_request(prompt: str, temperature: float, top_p: float, max_to
             "stream": False
         }
         
-        api_url = "https://api.fireworks.ai/inference/v1/chat/completions"
+        api_url = "https://api.fireworks.ai/inference/v1/completions"
     
     elif args.provider == "OpenRouter":
         headers = {
@@ -312,7 +315,7 @@ async def make_api_request(prompt: str, temperature: float, top_p: float, max_to
 
         payload = {
             "model": "deepseek/deepseek-r1-distill-qwen-14b",  # OpenRouter's model ID
-            "prompt": prompt,
+            # "prompt": prompt,
             "temperature": temperature,
             "top_p": top_p,
             "max_tokens": max_tokens,
@@ -337,68 +340,146 @@ async def make_api_request(prompt: str, temperature: float, top_p: float, max_to
     # Implement exponential backoff for retries
     max_retries = args.max_retries
     retry_delay = 2 if max_retries > 0 else None
+    return await handle_batch(api_url, headers, payload, prompt_dict)
+    # for attempt in range(max_retries):
+    #     try:
+            
+    #         # if not args.batch_size and args.provider != "Local":    
+    #             # Handle streaming responses for Together and Fireworks
+    #         if (args.provider in ["Together", "Fireworks", "OpenRouter",]): #and payload.get("stream", True):
+    #             return await handle_batch(api_url, headers, payload, prompt_dict)
+    #         # else:
+            
+    #     except Exception as e:
+    #         print(f"Exception during API request (attempt {attempt+1}/{max_retries}): {e}")
+            
+    #         # If it's the last attempt, return the error
+    #         if attempt == max_retries - 1:
+    #             return {"error": f"Request exception: {str(e)}"}
+            
+    #         # Otherwise retry
+    #         await asyncio.sleep(retry_delay * (2 ** attempt))
     
-    for attempt in range(max_retries):
+    # # If we get here, all retries failed
+    # return {"error": "All API request attempts failed"}
+
+async def handle_batch(api_url: str, headers: Dict, payload: Dict, prompt_dict: Dict) -> Dict:
+    """Processes a batch of prompts concurrently and returns dict mapping ID to response."""
+
+    limits = httpx.Limits(max_connections=100, max_keepalive_connections=20)
+    async with httpx.AsyncClient(limits=limits, timeout=240) as client:
+        response_dict = {}
+        
+        # Convert dict items to list and divide into batches
+        prompt_items = list(prompt_dict.items())
+        batch_size = args.batch_size
+        
+        # Process in batches
+        for batch_start in tqdm(range(0, len(prompt_items), batch_size)):
+            batch_end = min(batch_start + batch_size, len(prompt_items))
+            batch_items = prompt_items[batch_start:batch_end]
+            
+            tasks = {}
+            for prompt_id, prompt in batch_items:
+
+                # Create a unique payload for each prompt
+                payload_copy = payload.copy()
+                payload_copy['prompt'] = prompt
+                # Store task with ID as key
+                # Implement exponential backoff for retries
+                max_retries = args.max_retries
+                retry_delay = 2 if max_retries > 0 else None
+                if payload_copy.get("stream", False):
+                    response = handle_streaming_response(api_url, headers, payload_copy)
+                    tasks[prompt_id] = response
+                else:
+                    response = handle_non_streaming_response(client, api_url, headers, payload_copy)
+                    tasks[prompt_id] = response
+            
+            # Run all requests in this batch in parallel and preserve ID mapping
+            results = await asyncio.gather(*tasks.values())
+            
+            # Map results back to IDs for this batch
+            batch_response_dict = {prompt_id: result for prompt_id, result in zip(tasks.keys(), results)}
+            response_dict.update(batch_response_dict)
+        
+        return response_dict
+    
+async def handle_batch_v2(api_url: str, headers: Dict, payload: Dict, prompt_dict: Dict) -> Dict:
+    """Processes a batch of prompts concurrently and returns dict mapping ID to response."""
+
+    limits = httpx.Limits(max_connections=100, max_keepalive_connections=20)
+    async with httpx.AsyncClient(limits=limits, timeout=240) as client:
+        response_dict = {}
+        
+        # Convert dict items to list and divide into batches
+        prompt_items = list(prompt_dict.items())
+        batch_size = args.batch_size
+        
+        # Process in batches
+        for batch_start in tqdm(range(0, len(prompt_items), batch_size)):
+            batch_end = min(batch_start + batch_size, len(prompt_items))
+            batch_items = prompt_items[batch_start:batch_end]
+            
+            tasks = {}
+            
+            prompt_ids = [prompt_id for prompt_id, prompt in batch_items]
+            payload_copy = payload | {"prompt": [p for prompt_id, p in batch_items]}
+            response = handle_non_streaming_response(client, api_url, headers, payload_copy)
+            # tasks[prompt_id] = response
+
+            # results = await asyncio.gather(*tasks.values())
+            
+            # # Map results back to IDs for this batch
+            # batch_response_dict = {prompt_id: result for prompt_id, result in zip(tasks.keys(), results)}
+            # response_dict.update(batch_response_dict)
+        
+        return response_dict
+
+
+async def handle_non_streaming_response(client, api_url, headers, payload) -> Dict:
+    
         try:
-            # Handle streaming responses for Together and Fireworks
-            if (args.provider in ["Together", "Fireworks", "OpenRouter"]) and payload.get("stream", False):
-                return await handle_streaming_response(api_url, headers, payload)
-            
             # For non-streaming responses
-            async with httpx.AsyncClient() as client:
-                response = await client.post(api_url, headers=headers, json=payload, timeout=240)
+            # async with httpx.AsyncClient() as client:
+            response = await client.post(api_url, headers=headers, json=payload, timeout=240)
+            
+            # # Handle different error codes
+            # if response.status_code == 500:
+            #     print(f"Server error (500) on attempt {attempt+1}/{max_retries}. Retrying...")
+            #     await asyncio.sleep(retry_delay * (2 ** attempt))  # Exponential backoff
+            #     continue
                 
-                # Handle different error codes
-                if response.status_code == 500:
-                    print(f"Server error (500) on attempt {attempt+1}/{max_retries}. Retrying...")
-                    await asyncio.sleep(retry_delay * (2 ** attempt))  # Exponential backoff
-                    continue
-                    
-                elif response.status_code == 429:
-                    print(f"Rate limit (429) on attempt {attempt+1}/{max_retries}. Retrying...")
-                    await asyncio.sleep(retry_delay * (2 ** attempt) + random.uniform(1, 3))  # Add jitter
-                    continue
-                    
-                elif response.status_code != 200:
-                    print(f"Error from API: {response.status_code} - {response.text}")
-                    
-                    # If it's the last attempt, return the error
-                    if attempt == max_retries - 1:
-                        return {"error": f"API error: {response.status_code}", "details": response.text}
-                    
-                    # Otherwise retry
-                    await asyncio.sleep(retry_delay * (2 ** attempt))
-                    continue
+            # elif response.status_code == 429:
+            #     print(f"Rate limit (429) on attempt {attempt+1}/{max_retries}. Retrying...")
+            #     await asyncio.sleep(retry_delay * (2 ** attempt) + random.uniform(1, 3))  # Add jitter
+            #     continue
                 
-                # Success case
-                result = response.json()
+            if response.status_code != 200:
+                print(f"Error from API: {response.status_code} - {response.text}")
                 
-                if args.provider == "Novita" or args.provider == "Together":
-                    return {
-                        "text": result["choices"][0]["text"],
-                        "finish_reason": result["choices"][0].get("finish_reason", ""),
-                        "usage": result.get("usage", {})
-                    }
-                elif args.provider == "Fireworks":
-                    return {
-                        "text": result["choices"][0]["text"],
-                        "finish_reason": result["choices"][0].get("finish_reason", ""),
-                        "usage": result.get("usage", {})
-                    }
-
+                return {"error": f"API error: {response.status_code}", "details": response.text}
+                
+            
+            # Success case
+            result = response.json()
+            
+            if args.provider == "Novita" or args.provider == "Together":
+                return {
+                    "text": result["choices"][0]["text"],
+                    "finish_reason": result["choices"][0].get("finish_reason", ""),
+                    "usage": result.get("usage", {})
+                }
+            elif args.provider == "Fireworks":
+                return {
+                    "text": result["choices"][0]["text"],
+                    "finish_reason": result["choices"][0].get("finish_reason", ""),
+                    "usage": result.get("usage", {})
+                }  
         except Exception as e:
-            print(f"Exception during API request (attempt {attempt+1}/{max_retries}): {e}")
-            
-            # If it's the last attempt, return the error
-            if attempt == max_retries - 1:
-                return {"error": f"Request exception: {str(e)}"}
-            
-            # Otherwise retry
-            await asyncio.sleep(retry_delay * (2 ** attempt))
+            # if attempt == max_retries - 1:
+            return {"error": f"Request exception: {str(e)}"}
     
-    # If we get here, all retries failed
-    return {"error": "All API request attempts failed"}
-
 async def handle_streaming_response(api_url: str, headers: Dict, payload: Dict) -> Dict:
     """Handle streaming responses from Together or Fireworks API."""
     try:
@@ -468,7 +549,7 @@ async def handle_streaming_response(api_url: str, headers: Dict, payload: Dict) 
         print(f"Exception during streaming: {e}")
         return {"error": f"Streaming exception: {str(e)}"}
 
-async def generate_base_solution(problem: Dict, temperature: float = 0.6) -> Dict:
+async def generate_base_solution(problem_dict: Dict, temperature: float = 0.6) -> Dict:
     """
     Generate a base solution for a problem using Novita API.
     
@@ -480,33 +561,49 @@ async def generate_base_solution(problem: Dict, temperature: float = 0.6) -> Dic
         Dictionary with the generated solution
     """
     # Create prompt similar to generate_cots_math.py
-    prompt = f"Solve this math problem step by step. You MUST put your final answer in \\boxed{{}}. Problem: {problem['problem']} Solution: \n<think>\n"
-    
+
+    prompt_dict = {problem_idx: f"Solve this math problem step by step. You MUST put your final answer in \\boxed{{}}. Problem: {problem['problem']} Solution: \n<think>\n"
+                   for problem_idx, problem in problem_dict.items()}
+
     max_retries = 3
     retry_delay = 2
     
     for attempt in range(max_retries):
+        if attempt > 0:
+            print(f"Retrying base solution generation (attempt {attempt+1}/{max_retries})...")
         try:
-            response = await make_api_request(prompt, temperature, args.top_p, args.max_tokens)
-            print(f"Base solution generation response: {response}")
-            solution_text = response['text']
-            
-            # Extract answer and check correctness
-            extracted_answers = extract_boxed_answers(solution_text)
-            answer = extracted_answers[0] if extracted_answers else ""
-            is_correct = False
-            print(f"Generated base solution answer: {answer}")
-            print(f"GT answer: {problem.get('gt_answer')}")
-            if problem.get('gt_answer') and answer:
-                is_correct = check_answer(answer, problem['gt_answer'])
-            
-            return {
-                "prompt": prompt,
-                "solution": solution_text,
-                "full_cot": prompt + solution_text,
-                "answer": answer,
-                "is_correct": is_correct
-            }
+            responses = await make_api_request(prompt_dict, temperature, args.top_p, args.max_tokens)
+            response_dict = {}
+
+            # Now responses is {id: response_obj}
+            for problem_idx, response in responses.items():
+                try:
+                    solution_text = response['text']
+                    # print(f"Base solution generation response: {response}")
+                    solution_text = response['text']
+                    
+                    # Extract answer and check correctness
+                    extracted_answers = extract_boxed_answers(solution_text)
+                    answer = extracted_answers[0] if extracted_answers else ""
+                    is_correct = False
+                    print(f"Generated base solution answer: {answer}")
+                    print(f"GT answer: {problem_dict[problem_idx].get('gt_answer')}")
+                    if problem_dict[problem_idx].get('gt_answer') and answer:
+                        is_correct = check_answer(answer, problem_dict[problem_idx]['gt_answer'])
+                    response_dict[problem_idx] = {}
+                    response_dict[problem_idx]['prompt'] = prompt_dict[problem_idx]
+                    response_dict[problem_idx]['solution'] = solution_text
+                    response_dict[problem_idx]['full_cot'] = prompt_dict[problem_idx] + solution_text
+                    response_dict[problem_idx]['answer'] = answer
+                    response_dict[problem_idx]['is_correct'] = is_correct
+                except Exception as e:
+                    print(f"Error processing response for problem {problem_idx}: {e}")
+                    response_dict[problem_idx] = {
+                        "prompt": prompt_dict[problem_idx],
+                        "solution": f"Error: {str(e)}",
+                        "error": str(e)
+                    }
+            return response_dict
         except Exception as e:
             print(f"API error: {e}")
             if attempt < max_retries - 1:
@@ -515,12 +612,12 @@ async def generate_base_solution(problem: Dict, temperature: float = 0.6) -> Dic
                 await asyncio.sleep(wait_time)
             else:
                 return {
-                    "prompt": prompt,
+                    # "prompt": prompt,
                     "solution": f"Error: {str(e)}",
                     "error": str(e)
                 }
 
-async def generate_rollout(problem: Dict, chunk_text: str, full_cot_prefix: str, temperature: float = 0.7, rollout_type: str = 'default') -> Dict:
+async def generate_rollouts(problem: Dict, chunk_text: str, full_cot_prefix: str, temperature: float = 0.7, rollout_type: str = 'default') -> Dict:
     """
     Generate a rollout by removing a specific chunk and regenerating from that point.
     
@@ -547,28 +644,32 @@ async def generate_rollout(problem: Dict, chunk_text: str, full_cot_prefix: str,
     
     for attempt in range(max_retries):
         try:
-            response = await make_api_request(prompt, temperature, args.top_p, args.max_tokens)
-            
-            rollout_text = response['text']
-            chunk_resampled = split_solution_into_chunks(rollout_text)[0]
-            
-            # Extract answer and check correctness
-            extracted_answers = extract_boxed_answers(f"{prompt}{rollout_text}" if rollout_type == 'forced_answer' else rollout_text)
-            answer = extracted_answers[0] if extracted_answers else ""
-            is_correct = False
-            
-            if problem.get('gt_answer') and answer:
-                is_correct = check_answer(answer, problem['gt_answer'])
-            
-            return {
-                "chunk_removed": chunk_text,
-                "prefix_without_chunk": prefix_without_chunk,
-                "chunk_resampled": chunk_resampled,
-                "rollout": rollout_text,
-                "full_cot": f"{prompt}{rollout_text}",
-                "answer": answer,
-                "is_correct": is_correct
-            }
+            prompt_dict = {idx:prompt for idx in range(args.num_rollouts)}
+            response_dict = await make_api_request(prompt_dict, temperature, args.top_p, args.max_tokens)
+            responses = {}
+            for idx, response in response_dict.items():    
+                rollout_text = response['text']
+                chunk_resampled = split_solution_into_chunks(rollout_text)[0]
+                
+                # Extract answer and check correctness
+                extracted_answers = extract_boxed_answers(f"{prompt}{rollout_text}" if rollout_type == 'forced_answer' else rollout_text)
+                answer = extracted_answers[0] if extracted_answers else ""
+                is_correct = False
+                
+                if problem.get('gt_answer') and answer:
+                    is_correct = check_answer(answer, problem['gt_answer'])
+                
+                responses[idx] = {
+                    "chunk_removed": chunk_text,
+                    "prefix_without_chunk": prefix_without_chunk,
+                    "chunk_resampled": chunk_resampled,
+                    "rollout": rollout_text,
+                    "full_cot": f"{prompt}{rollout_text}",
+                    "answer": answer,
+                    "is_correct": is_correct
+                }
+            return responses
+
         except Exception as e:
             print(f"API error: {e}")
             if attempt < max_retries - 1:
@@ -576,14 +677,14 @@ async def generate_rollout(problem: Dict, chunk_text: str, full_cot_prefix: str,
                 print(f"Retrying in {wait_time} seconds...")
                 await asyncio.sleep(wait_time)
             else:
-                return {
+                return {0:{
                     "chunk_removed": chunk_text,
                     "prefix_without_chunk": prefix_without_chunk,
                     "error": str(e),
                     "response":response
-                }
+                }}
 
-async def process_problem(problem_idx: int, problem: Dict) -> None:
+async def process_problems(problem_dict: Dict) -> None:
     """
     Process a single problem: generate base solution and rollouts.
     
@@ -591,222 +692,246 @@ async def process_problem(problem_idx: int, problem: Dict) -> None:
         problem_idx: Index of the problem
         problem: Problem dictionary
     """
-    problem_dir = output_dir / f"problem_{problem_idx}"
-    problem_dir.mkdir(exist_ok=True, parents=True)
-    
-    # Save problem
-    problem_file = problem_dir / "problem.json"
-    if not problem_file.exists() or args.force:
-        with open(problem_file, 'w', encoding='utf-8') as f:
-            json.dump(problem, f, indent=2)
-    
-    # Check if base solution already exists
-    base_solution_file = problem_dir / "base_solution.json"
-    base_solution = None
-    if base_solution_file.exists() and not args.force:
-        with open(base_solution_file, 'r', encoding='utf-8') as f:
-            base_solution = json.load(f)
-            print(f"Problem {problem_idx}: Loaded existing base solution")
-            
-            # Recalculate accuracy for base solution if needed
-            if not args.skip_recalculate and 'solution' in base_solution:
-                extracted_answers = extract_boxed_answers(base_solution['solution'])
-                answer = extracted_answers[0] if extracted_answers else ""
-                is_correct = False
-                
-                if problem.get('gt_answer') and answer:
-                    is_correct = check_answer(answer, problem['gt_answer'])
-                
-                # Update if different
-                if base_solution.get('answer') != answer or base_solution.get('is_correct') != is_correct:
-                    print(f"Problem {problem_idx}: Updating base solution accuracy")
-                    base_solution['answer'] = answer
-                    base_solution['is_correct'] = is_correct
-                    
-                    # Save updated base solution
-                    with open(base_solution_file, 'w', encoding='utf-8') as f:
-                        json.dump(base_solution, f, indent=2)
-    
-    # Generate base solution if needed
-    if base_solution is None:
-        print(f"Problem {problem_idx}: Generating {args.base_solution_type} base solution")
-        base_solution = await generate_base_solution(problem, args.temperature)
-            
-        if args.base_solution_type == "correct" and ("is_correct" not in base_solution or not base_solution["is_correct"]):
-            print(base_solution["solution"])
-            print(f"Problem {problem_idx}: Base solution is INCORRECT or has error. Retrying...")
-            return await process_problem(problem_idx, problem)
-        elif args.base_solution_type == "incorrect" and ("is_correct" not in base_solution or base_solution["is_correct"]):
-            print(base_solution["solution"])
-            print(f"Problem {problem_idx}: Base solution is CORRECT or has error. Retrying...")
-            return await process_problem(problem_idx, problem)
-        
-        # Save base solution
-        with open(base_solution_file, 'w', encoding='utf-8') as f:
-            json.dump(base_solution, f, indent=2)
-    
-    # Get the source text for chunking
-    source_text = base_solution["full_cot"]
-    print(f"Problem {problem_idx}: Using full CoT for chunking")
-    
-    # Extract the solution part for chunking
-    if "<think>" in source_text:
-        solution_text = source_text.split("<think>")[1].strip()
-        if "</think>" in solution_text:
-            solution_text = solution_text.split("</think>")[0].strip()
-    else:
-        solution_text = source_text
-    
-    # Save chunks to a separate file
-    chunks_file = problem_dir / "chunks.json"
-    
-    if not chunks_file.exists() or args.force:
-        chunks = split_solution_into_chunks(solution_text)
-        print(f"Problem {problem_idx}: Split into {len(chunks)} chunks")
-        
-        with open(chunks_file, 'w', encoding='utf-8') as f:
-            json.dump({"source_text": source_text, "solution_text": solution_text, "chunks": chunks}, f, indent=2)
-        
-        print(f"Problem {problem_idx}: Saved chunks to {chunks_file}")
-    else:
-        with open(chunks_file, 'r', encoding='utf-8') as f:
-            chunks = json.load(f)['chunks']
-        print(f"Problem {problem_idx}: Loaded {len(chunks)} existing chunks")
-    
-    if len(chunks) > args.max_chunks:
-        print(f"Problem {problem_idx}: Too many chunks. Will not generate rollouts.")
-        return
-    
-    # Build cumulative chunks for proper continuation
-    cumulative_chunks = []
-    current_cumulative = ""
-    for chunk in chunks:
-        current_cumulative += chunk + " "
-        cumulative_chunks.append(current_cumulative.strip())
-    
-    # Process each chunk
-    for chunk_idx, (chunk, full_prefix) in enumerate(zip(chunks[:1], cumulative_chunks[:1])):           ## NO OF CHUNKS TO GENERATE FOR !!
+    base_solution_dict ={}
+    problem_dict_working = problem_dict.copy()
 
-        if args.include_chunks and str(chunk_idx) not in args.include_chunks.split(","):
-            print(f"Problem {problem_idx}, Chunk {chunk_idx}: Skipping (not in include_chunks)")
-            continue
+    for problem_idx, problem in problem_dict.items():
+
+        problem_dir = output_dir / f"problem_{problem_idx}"
+        problem_dir.mkdir(exist_ok=True, parents=True)
         
-        chunk_dir = problem_dir / f"chunk_{chunk_idx}"
-        chunk_dir.mkdir(exist_ok=True, parents=True)
+        # Save problem
+        problem_file = problem_dir / "problem.json"
+        if not problem_file.exists() or args.force:
+            with open(problem_file, 'w', encoding='utf-8') as f:
+                json.dump(problem, f, indent=2)
         
-        # Check if solutions already exist
-        solutions_file = chunk_dir / "solutions.json"
-        existing_solutions = []
-        valid_existing_solutions = []
-        
-        if solutions_file.exists() and not args.force:
-            with open(solutions_file, 'r', encoding='utf-8') as f:
-                existing_solutions = json.load(f)
+        # Check if base solution already exists
+        base_solution_file = problem_dir / "base_solution.json"
+        base_solution = None
+        base_solution_dict[problem_idx] = {}
+        base_solution_dict[problem_idx]['base_solution_file'] = base_solution_file
+        base_solution_dict[problem_idx]['base_solution'] = base_solution
+        if base_solution_file.exists() and not args.force:
+            try:
+                with open(base_solution_file, 'r', encoding='utf-8') as f:
+                    base_solution = json.load(f)
+                    print(f"Problem {problem_idx}: Loaded existing base solution")
+            except json.JSONDecodeError:
+                print(f"Problem {problem_idx}: Corrupted base_solution.json file. Will regenerate.")
+                base_solution = None
                 
-                # Recalculate accuracy for existing rollouts if needed
-                if not args.skip_recalculate:
-                    updated_count = 0
-                    for rollout in existing_solutions:
-                        if 'rollout' in rollout and 'error' not in rollout:
-                            extracted_answers = extract_boxed_answers(rollout['full_cot'] if args.rollout_type == 'forced_answer' else rollout['rollout'])
-                            answer = extracted_answers[0] if extracted_answers else ""
-                            is_correct = False
-                            
-                            if problem.get('gt_answer') and answer:
-                                is_correct = check_answer(answer, problem['gt_answer'])
-                            
-                            # Update if different
-                            if rollout.get('answer') != answer or rollout.get('is_correct') != is_correct:
-                                updated_count += 1
-                                rollout['answer'] = answer
-                                rollout['is_correct'] = is_correct
-                    
-                    if updated_count > 0:
-                        print(f"Problem {problem_idx}, Chunk {chunk_idx}: Updated accuracy for {updated_count} rollouts")
-                        # Save updated rollouts
-                        with open(solutions_file, 'w', encoding='utf-8') as f:
-                            json.dump(existing_solutions, f, indent=2)
-                
-                # Filter for valid solutions (has answer and no error)
-                valid_existing_solutions = [s for s in existing_solutions if 'answer' in s and 'error' not in s]
-                print(f"Problem {problem_idx}, Chunk {chunk_idx}: Found {len(valid_existing_solutions)} valid solutions")
-        
-        # Generate rollouts if needed
-        num_rollouts_needed = args.num_rollouts - len(valid_existing_solutions)
-        
-        if num_rollouts_needed > 0:
-            print(f"Problem {problem_idx}, Chunk {chunk_idx}: Generating {num_rollouts_needed} rollouts")
-            
-            # For Local provider, we can use batch processing
-            if args.provider == "Local":
-                # Create prompts for all rollouts
-                prompts = []
-                for _ in tqdm(range(num_rollouts_needed), desc="Generating rollouts"):
-                    # Remove the current chunk from the prefix to see how it gets regenerated
-                    prefix_without_chunk = full_prefix.replace(chunk, "").strip()
-                    
-                    # Create prompt with the prefix without the current chunk
-                    prompt = f"Solve this math problem step by step. You MUST put your final answer in \\boxed{{}}. Problem: {problem['problem']} Solution: \n<think>\n{prefix_without_chunk}"
-                    
-                    if args.rollout_type == 'forced_answer':
-                        prompt += "\n</think>\n\nTherefore, the final answers is \\boxed{"
-                    
-                    prompts.append(prompt)
-                
-                # Generate all rollouts in batch
-                batch_results = generate_with_local_model_batch(prompts, args.temperature, args.top_p, args.max_tokens)
-                
-                # Process results
-                new_solutions = []
-                for i, result in enumerate(batch_results):
-                    rollout_text = result.get('text', '')
-                    
-                    # Skip if there was an error
-                    if 'error' in result:
-                        new_solutions.append({"error": result['error']})
-                        continue
-                    
-                    # Create the rollout object
-                    prefix_without_chunk = full_prefix.replace(chunk, "").strip()
-                    chunk_resampled = split_solution_into_chunks(rollout_text)[0] if rollout_text else ""
-                    
-                    # Extract answer and check correctness
-                    prompt = prompts[i]
-                    extracted_answers = extract_boxed_answers(f"{prompt}{rollout_text}" if args.rollout_type == 'forced_answer' else rollout_text)
+                # Recalculate accuracy for base solution if needed
+                if not args.skip_recalculate and 'solution' in base_solution:
+                    extracted_answers = extract_boxed_answers(base_solution['solution'])
                     answer = extracted_answers[0] if extracted_answers else ""
                     is_correct = False
                     
                     if problem.get('gt_answer') and answer:
                         is_correct = check_answer(answer, problem['gt_answer'])
                     
-                    new_solutions.append({
-                        "chunk_removed": chunk,
-                        "prefix_without_chunk": prefix_without_chunk,
-                        "chunk_resampled": chunk_resampled,
-                        "rollout": rollout_text,
-                        "full_cot": f"{prompt}{rollout_text}",
-                        "answer": answer,
-                        "is_correct": is_correct
-                    })
-            else:
-                # For API providers, we can generate in parallel
-                tasks = [generate_rollout(problem, chunk, full_prefix, args.temperature, args.rollout_type) for _ in range(num_rollouts_needed)]
-                new_solutions = await asyncio.gather(*tasks)
+                    # Update if different
+                    if base_solution.get('answer') != answer or base_solution.get('is_correct') != is_correct:
+                        print(f"Problem {problem_idx}: Updating base solution accuracy")
+                        base_solution['answer'] = answer
+                        base_solution['is_correct'] = is_correct
+                        
+                        # Save updated base solution
+                        with open(base_solution_file, 'w', encoding='utf-8') as f:
+                            json.dump(base_solution, f, indent=2)
+        if base_solution is not None: # and "error" not in base_solution:
+            del problem_dict_working[problem_idx]
+            base_solution_dict[problem_idx]['base_solution'] = base_solution
             
-            for sol in new_solutions:
-                if 'error' in sol.keys():
-                    print(sol)
-            
-            # Combine with existing solutions
-            all_solutions = existing_solutions + new_solutions
-            # Save all solutions
-            with open(solutions_file, 'w', encoding='utf-8') as f:
-                json.dump(all_solutions, f, indent=2)
-            
-            print(f"Problem {problem_idx}, Chunk {chunk_idx}: Saved {len(all_solutions)} solutions")
+    base_solution_response_dict = {problem_idx:base_solution_dict[problem_idx]['base_solution'] 
+                                   for problem_idx in base_solution_dict 
+                                   if problem_idx not in problem_dict_working}
+    
+    # Generate base solution if needed
+    if problem_dict_working:
+        print(f"Problems {list(problem_dict_working.keys())}: Generating {args.base_solution_type} base solution")
+        new_base_solutions = await generate_base_solution(problem_dict_working, args.temperature)
+        base_solution_response_dict.update(new_base_solutions)
+        # if args.base_solution_type == "correct" and ("is_correct" not in base_solution or not base_solution["is_correct"]):
+        #     print(base_solution["solution"])
+        #     print(f"Problem {problem_idx}: Base solution is INCORRECT or has error. Retrying...")
+        #     return await process_problems(problem_idx, problem)
+        # elif args.base_solution_type == "incorrect" and ("is_correct" not in base_solution or base_solution["is_correct"]):
+        #     print(base_solution["solution"])
+        #     print(f"Problem {problem_idx}: Base solution is CORRECT or has error. Retrying...")
+        #     return await process_problems(problem_idx, problem)
+    
+    for problem_idx, base_solution_response in tqdm(base_solution_response_dict.items()):
+        # Save base solution
+        problem_dir = output_dir / f"problem_{problem_idx}"
+        with open(base_solution_dict[problem_idx]['base_solution_file'], 'w', encoding='utf-8') as f:
+            json.dump(base_solution_response, f, indent=2)
+        
+        # Get the source text for chunking
+        source_text = base_solution_response["full_cot"]
+        # print(f"Problem {problem_idx}: Using full CoT for chunking")
+        
+        # Extract the solution part for chunking
+        if "<think>" in source_text:
+            solution_text = source_text.split("<think>")[1].strip()
+            if "</think>" in solution_text:
+                solution_text = solution_text.split("</think>")[0].strip()
         else:
-            print(f"Problem {problem_idx}, Chunk {chunk_idx}: Already have {len(valid_existing_solutions)} valid solutions")
+            solution_text = source_text
+        
+        # Save chunks to a separate file
+        chunks_file = problem_dir / "chunks.json"
+        
+        if not chunks_file.exists() or args.force:
+            chunks = split_solution_into_chunks(solution_text)
+            print(f"Problem {problem_idx}: Split into {len(chunks)} chunks")
+            
+            with open(chunks_file, 'w', encoding='utf-8') as f:
+                json.dump({"source_text": source_text, "solution_text": solution_text, "chunks": chunks}, f, indent=2)
+            
+            print(f"Problem {problem_idx}: Saved chunks to {chunks_file}")
+        else:
+            with open(chunks_file, 'r', encoding='utf-8') as f:
+                chunks = json.load(f)['chunks']
+            print(f"Problem {problem_idx}: Loaded {len(chunks)} existing chunks")
+        
+        # if len(chunks) > args.max_chunks:
+        #     print(f"Problem {problem_idx}: Too many chunks. Will not generate rollouts.")
+        #     return
+        
+        # Build cumulative chunks for proper continuation
+        cumulative_chunks = []
+        current_cumulative = ""
+        for chunk in chunks:
+            current_cumulative += chunk + " "
+            cumulative_chunks.append(current_cumulative.strip())
+        
+        # Process each chunk
+        for chunk_idx, (chunk, full_prefix) in enumerate(zip(chunks, cumulative_chunks)):           ## NO OF CHUNKS TO GENERATE FOR !!
 
+            if args.include_chunks and str(chunk_idx) not in args.include_chunks.split(","):
+                print(f"Problem {problem_idx}, Chunk {chunk_idx}: Skipping (not in include_chunks)")
+                continue
+            
+            chunk_dir = problem_dir / f"chunk_{chunk_idx}"
+            chunk_dir.mkdir(exist_ok=True, parents=True)
+            
+            # Check if solutions already exist
+            solutions_file = chunk_dir / "solutions.json"
+            existing_solutions = []
+            valid_existing_solutions = []
+            
+            if solutions_file.exists() and not args.force:
+                with open(solutions_file, 'r', encoding='utf-8') as f:
+                    existing_solutions = json.load(f)
+                    
+                    # Recalculate accuracy for existing rollouts if needed
+                    if not args.skip_recalculate:
+                        updated_count = 0
+                        for rollout in existing_solutions:
+                            if 'rollout' in rollout and 'error' not in rollout:
+                                extracted_answers = extract_boxed_answers(rollout['full_cot'] if args.rollout_type == 'forced_answer' else rollout['rollout'])
+                                answer = extracted_answers[0] if extracted_answers else ""
+                                is_correct = False
+                                
+                                if problem.get('gt_answer') and answer:
+                                    is_correct = check_answer(answer, problem['gt_answer'])
+                                
+                                # Update if different
+                                if rollout.get('answer') != answer or rollout.get('is_correct') != is_correct:
+                                    updated_count += 1
+                                    rollout['answer'] = answer
+                                    rollout['is_correct'] = is_correct
+                        
+                        if updated_count > 0:
+                            print(f"Problem {problem_idx}, Chunk {chunk_idx}: Updated accuracy for {updated_count} rollouts")
+                            # Save updated rollouts
+                            with open(solutions_file, 'w', encoding='utf-8') as f:
+                                json.dump(existing_solutions, f, indent=2)
+                    
+                    # Filter for valid solutions (has answer and no error)
+                    valid_existing_solutions = [s for s in existing_solutions if 'answer' in s and 'error' not in s]
+                    print(f"Problem {problem_idx}, Chunk {chunk_idx}: Found {len(valid_existing_solutions)} valid solutions")
+            
+            # Generate rollouts if needed
+            num_rollouts_needed = args.num_rollouts - len(valid_existing_solutions)
+            
+            if num_rollouts_needed > 0:
+                print(f"Problem {problem_idx}, Chunk {chunk_idx}: Generating {num_rollouts_needed} rollouts")
+                
+                # For Local provider, we can use batch processing
+                if args.provider == "Local":
+                    # Create prompts for all rollouts
+                    prompts = []
+                    for _ in tqdm(range(num_rollouts_needed), desc="Generating rollouts"):
+                        # Remove the current chunk from the prefix to see how it gets regenerated
+                        prefix_without_chunk = full_prefix.replace(chunk, "").strip()
+                        
+                        # Create prompt with the prefix without the current chunk
+                        prompt = f"Solve this math problem step by step. You MUST put your final answer in \\boxed{{}}. Problem: {problem['problem']} Solution: \n<think>\n{prefix_without_chunk}"
+                        
+                        if args.rollout_type == 'forced_answer':
+                            prompt += "\n</think>\n\nTherefore, the final answers is \\boxed{"
+                        
+                        prompts.append(prompt)
+                    
+                    # Generate all rollouts in batch
+                    batch_results = generate_with_local_model_batch(prompts, args.temperature, args.top_p, args.max_tokens)
+                    
+                    # Process results
+                    new_solutions = []
+                    for i, result in enumerate(batch_results):
+                        rollout_text = result.get('text', '')
+                        
+                        # Skip if there was an error
+                        if 'error' in result:
+                            new_solutions.append({"error": result['error']})
+                            continue
+                        
+                        # Create the rollout object
+                        prefix_without_chunk = full_prefix.replace(chunk, "").strip()
+                        chunk_resampled = split_solution_into_chunks(rollout_text)[0] if rollout_text else ""
+                        
+                        # Extract answer and check correctness
+                        prompt = prompts[i]
+                        extracted_answers = extract_boxed_answers(f"{prompt}{rollout_text}" if args.rollout_type == 'forced_answer' else rollout_text)
+                        answer = extracted_answers[0] if extracted_answers else ""
+                        is_correct = False
+                        
+                        if problem.get('gt_answer') and answer:
+                            is_correct = check_answer(answer, problem['gt_answer'])
+                        
+                        new_solutions.append({
+                            "chunk_removed": chunk,
+                            "prefix_without_chunk": prefix_without_chunk,
+                            "chunk_resampled": chunk_resampled,
+                            "rollout": rollout_text,
+                            "full_cot": f"{prompt}{rollout_text}",
+                            "answer": answer,
+                            "is_correct": is_correct
+                        })
+                else:
+                    # For API providers, we can generate in parallel
+                    # tasks = [generate_rollouts(problem_dict_working[problem_idx], chunk, full_prefix, args.temperature, args.rollout_type) for _ in range(num_rollouts_needed)]
+                    new_solutions_dict = await generate_rollouts(problem_dict[problem_idx], chunk, full_prefix, args.temperature, args.rollout_type)
+                    new_solutions = list(new_solutions_dict.values())
+                for sol in new_solutions:
+                    if 'error' in sol.keys():
+                        print(sol)
+                
+                # Combine with existing solutions
+                all_solutions = existing_solutions + new_solutions
+                # Save all solutions
+                with open(solutions_file, 'w', encoding='utf-8') as f:
+                    json.dump(all_solutions, f, indent=2)
+                
+                print(f"Problem {problem_idx}, Chunk {chunk_idx}: Saved {len(all_solutions)} solutions")
+            else:
+                print(f"Problem {problem_idx}, Chunk {chunk_idx}: Already have {len(valid_existing_solutions)} valid solutions")
+    else:
+        chunks = []
+        cumulative_chunks = []
+    
 async def main():
     """Main function to run the script."""
     # Load problems
@@ -827,9 +952,22 @@ async def main():
 
     print(f"Loaded {len(problems)} problems.")
     
-    # Process problems
-    for problem_idx, problem in tqdm(problems, desc="Processing problems"):
-        await process_problem(problem_idx, problem)
+    await process_problems({problem_idx: problem for problem_idx, problem in problems})
+      
+    # # Process problems in batches
+    # batch_size = args.batch_size
+    # total_batches = (len(problems) + batch_size - 1) // batch_size
+    
+    # for batch_num in tqdm(range(total_batches)):
+    #     start_idx = batch_num * batch_size
+    #     end_idx = min(start_idx + batch_size, len(problems))
+    #     batch_problems = problems[start_idx:end_idx]
+        
+    #     # Create a dictionary for this batch {problem_idx: problem}
+    #     problem_dict = {problem_idx: problem for problem_idx, problem in batch_problems}
+
+    #     print(f"Processing batch {batch_num + 1}/{total_batches}")
+    #     await process_problems(problem_dict)
 
 if __name__ == "__main__":
     asyncio.run(main())

@@ -65,7 +65,7 @@ IMPORTANCE_METRICS = [
     "forced_importance_kl",
 ]
 
-model = "deepseek-r1-distill-qwen-14b"
+model = "accounts/pdlodaya-l7vcn0oxxgj/deployments/e2zlc2rg"
 # model = "deepseek-r1-distill-llama-8b"
 smoothing = 1e-9
 # smoothing = 0.5
@@ -74,6 +74,7 @@ smoothing = 1.0
 parser = argparse.ArgumentParser(
     description="Analyze rollout data and label chunks"
 )
+
 parser.add_argument(
     "-ic",
     "--correct_rollouts_dir",
@@ -81,6 +82,7 @@ parser.add_argument(
     default=f"math-rollouts/{model}/temperature_0.6_top_p_0.95/correct_base_solution",
     help="Directory containing correct rollout data",
 )
+
 parser.add_argument(
     "-ii",
     "--incorrect_rollouts_dir",
@@ -88,6 +90,7 @@ parser.add_argument(
     default=f"math-rollouts/{model}/temperature_0.6_top_p_0.95/incorrect_base_solution",
     help="Directory containing incorrect rollout data",
 )
+
 parser.add_argument(
     "-icf",
     "--correct_forced_answer_rollouts_dir",
@@ -95,6 +98,7 @@ parser.add_argument(
     default=f"math-rollouts/{model}/temperature_0.6_top_p_0.95/correct_base_solution_forced_answer",
     help="Directory containing correct rollout data with forced answers",
 )
+
 parser.add_argument(
     "-iif",
     "--incorrect_forced_answer_rollouts_dir",
@@ -102,6 +106,7 @@ parser.add_argument(
     default=f"math-rollouts/{model}/temperature_0.6_top_p_0.95/incorrect_base_solution_forced_answer",
     help="Directory containing incorrect rollout data with forced answers",
 )
+
 parser.add_argument(
     "-o",
     "--output_dir",
@@ -109,6 +114,7 @@ parser.add_argument(
     default=f"analysis/basic/{model}/alpha_{smoothing}",
     help="Directory to save analysis results (defaults to rollouts_dir)",
 )
+
 parser.add_argument(
     "-p",
     "--problems",
@@ -116,6 +122,7 @@ parser.add_argument(
     default=None,
     help="Comma-separated list of problem indices to analyze (default: all)",
 )
+
 parser.add_argument(
     "-m",
     "--max_problems",
@@ -123,6 +130,7 @@ parser.add_argument(
     default=None,
     help="Maximum number of problems to analyze",
 )
+
 parser.add_argument(
     "-a",
     "--absolute",
@@ -130,6 +138,7 @@ parser.add_argument(
     action="store_true",
     help="Use absolute value for importance calculation",
 )
+
 parser.add_argument(
     "-f",
     "--force_relabel",
@@ -137,6 +146,7 @@ parser.add_argument(
     action="store_true",
     help="Force relabeling of chunks",
 )
+
 parser.add_argument(
     "-fm",
     "--force_metadata",
@@ -144,6 +154,7 @@ parser.add_argument(
     action="store_true",
     help="Force regeneration of chunk summaries and problem nicknames",
 )
+
 parser.add_argument(
     "-d",
     "--dag_dir",
@@ -151,6 +162,7 @@ parser.add_argument(
     default=f"archive/analysis/math/{model}",
     help="Directory containing DAG-improved chunks for token frequency analysis",
 )
+
 parser.add_argument(
     "-t",
     "--token_analysis_source",
@@ -453,7 +465,6 @@ def generate_chunk_summary(chunk_text: str) -> str:
         print(f"Error generating chunk summary: {e}")
         return "unknown action"
 
-
 def generate_problem_nickname(problem_text: str) -> str:
     """
     Generate a 2-3 word nickname for a problem using OpenAI API.
@@ -502,7 +513,6 @@ def generate_problem_nickname(problem_text: str) -> str:
         print(f"Error generating problem nickname: {e}")
         return "math problem"
 
-
 def label_chunk(problem_text: str, chunks: List[str], chunk_idx: int) -> Dict:
     """
     Label a chunk using OpenAI API with the DAG prompt.
@@ -549,7 +559,6 @@ def label_chunk(problem_text: str, chunks: List[str], chunk_idx: int) -> Dict:
             "chunk_idx": chunk_idx,
         }
 
-
 def process_chunk_importance(
     chunk_idx,
     chunk_info,
@@ -583,6 +592,7 @@ def process_chunk_importance(
             chunk_idx, chunk_info, chunk_embedding_cache, chunk_accuracies, args
         )
     )
+    
     cf_kl = calculate_counterfactual_importance_kl(
         chunk_idx,
         chunk_info,
@@ -591,6 +601,7 @@ def process_chunk_importance(
         chunk_answers,
         args,
     )
+    
     metrics.update(
         {
             "counterfactual_importance_accuracy": cf_acc,
@@ -647,7 +658,6 @@ def process_chunk_importance(
 
     return chunk_idx, metrics
 
-
 def calculate_counterfactual_importance_accuracy(
     chunk_idx, chunk_info, chunk_embedding_cache, chunk_accuracies, args
 ):
@@ -664,6 +674,7 @@ def calculate_counterfactual_importance_accuracy(
     Returns:
         float: Counterfactual importance score
     """
+    
     if chunk_idx not in chunk_info:
         return 0.0, 0.0, 0.0
 
@@ -778,7 +789,6 @@ def calculate_counterfactual_importance_accuracy(
         else diff
     )
     return diff, different_trajectories_fraction, overdeterminedness
-
 
 def calculate_counterfactual_importance_kl(
     chunk_idx,
@@ -928,7 +938,6 @@ def calculate_counterfactual_importance_kl(
 
     return kl_div
 
-
 def calculate_resampling_importance_accuracy(
     chunk_idx, chunk_accuracies, args=None
 ):
@@ -965,7 +974,6 @@ def calculate_resampling_importance_accuracy(
     if args and hasattr(args, "use_abs_importance") and args.use_abs_importance:
         return abs(diff)
     return diff
-
 
 def calculate_resampling_importance_kl(
     chunk_idx, chunk_info, problem_dir, args=None
@@ -1033,7 +1041,6 @@ def calculate_resampling_importance_kl(
         alpha=args.laplace_alpha,
     )
 
-
 def calculate_forced_importance_accuracy(
     chunk_idx, forced_answer_accuracies, args=None
 ):
@@ -1070,7 +1077,6 @@ def calculate_forced_importance_accuracy(
     if args and hasattr(args, "use_abs_importance") and args.use_abs_importance:
         return abs(diff)
     return diff
-
 
 def calculate_forced_importance_kl(
     chunk_idx,
@@ -1172,10 +1178,10 @@ def calculate_forced_importance_kl(
         alpha=args.laplace_alpha,
     )
 
-
 def compute_global_vocabulary(
     problem_dirs: List[Path], use_prob_true: bool = True
 ) -> Optional[set]:
+
     """
     Compute the global vocabulary of all unique answers across all problems.
 
@@ -1222,7 +1228,6 @@ def compute_global_vocabulary(
 
     print(f"Global vocabulary size: {len(global_vocab)} unique answers")
     return global_vocab
-
 
 def calculate_kl_divergence(
     chunk_sols1,
@@ -1330,6 +1335,7 @@ def calculate_kl_divergence(
         observed_answers = set(answer_counts1.keys()) | set(
             answer_counts2.keys()
         )
+
         kl_div = 0.0
         for answer in observed_answers:
             count1 = answer_counts1[answer]
@@ -1344,7 +1350,6 @@ def calculate_kl_divergence(
             kl_div += p_unsmoothed * math.log(p / q)
 
         return max(0.0, kl_div)
-
 
 def analyze_problem(
     problem_dir: Path,
@@ -1546,6 +1551,7 @@ def analyze_problem(
                             "is_correct": sol.get("is_correct", False),
                             "answer": normalize_answer(sol.get("answer", "")),
                         }
+
                         chunk_info[chunk_idx].append(info)
 
     # Initialize embedding model and cache at the problem level
@@ -1924,7 +1930,6 @@ def analyze_problem(
         "token_counts": token_counts,
         "forced_answer_accuracies": forced_answer_accuracies_list,
     }
-
 
 def generate_plots(
     results: List[Dict],
@@ -2419,7 +2424,6 @@ def generate_plots(
     # Return the category importance ranking
     return tag_importance
 
-
 def analyze_chunk_variance(
     results: List[Dict],
     output_dir: Path,
@@ -2614,7 +2618,6 @@ def analyze_chunk_variance(
 
     print(f"Chunk variance analysis saved to {variance_dir}")
 
-
 def analyze_function_tag_variance(
     results: List[Dict],
     output_dir: Path,
@@ -2762,7 +2765,6 @@ def analyze_function_tag_variance(
     plt.close()
 
     print(f"Function tag variance analysis saved to {variance_dir}")
-
 
 def analyze_within_problem_variance(
     results: List[Dict],
@@ -2945,7 +2947,6 @@ def analyze_within_problem_variance(
         plt.close()
 
     print(f"Within-problem variance analysis saved to {variance_dir}")
-
 
 def plot_chunk_accuracy_by_position(
     results: List[Dict],
@@ -3425,7 +3426,6 @@ def plot_chunk_accuracy_by_position(
 
     print(f"Chunk accuracy plots saved to {explore_dir}")
 
-
 def process_rollouts(
     rollouts_dir: Path,
     output_dir: Path,
@@ -3657,7 +3657,6 @@ def process_rollouts(
         f"{rollout_type.capitalize()} analysis complete. Results saved to {output_dir}"
     )
 
-
 def analyze_dag_token_frequencies(dag_dir: Path, output_dir: Path) -> None:
     """
     Analyze token frequencies from DAG-improved chunks.
@@ -3868,7 +3867,6 @@ def analyze_dag_token_frequencies(dag_dir: Path, output_dir: Path) -> None:
         )
         with open(token_frequencies_file, "w", encoding="utf-8") as f:
             json.dump(category_ngram_frequencies, f, indent=2)
-
 
 def analyze_token_frequencies(
     results: List[Dict],
@@ -4647,6 +4645,7 @@ def analyze_response_length_statistics(
 
 
 def main():
+    
     # Set up directories
     correct_rollouts_dir = (
         Path(args.correct_rollouts_dir)

@@ -1,0 +1,11 @@
+Problems with high variance in chunk importance (potential reasoning forks):
+
+Problem 1923:
+  Overall variance: 0.002124
+  Mean importance: -0.003686
+  Potential fork reasoning steps:
+    Chunk 0:
+      Importance: -0.600000 (z-score: -12.94)
+      Function tags: problem_setup
+      Text: Okay, so I have this problem: I need to figure out how many ways I can arrange the digits of 1150 to...
+

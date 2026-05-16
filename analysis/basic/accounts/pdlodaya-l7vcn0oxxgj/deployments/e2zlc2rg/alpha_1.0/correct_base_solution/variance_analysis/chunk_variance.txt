@@ -1,0 +1,237 @@
+Problems with highest variance in chunk importance (potential reasoning forks):
+
+Problem 1923: Variance = 0.002124
+  Chunks by importance:
+    1. Chunk 3: 0.0100 - problem_setup - 'First, let me understand the problem clearly.'
+    2. Chunk 35: 0.0100 - plan_generation - 'How many such permutations have 0 in the first ...'
+    3. Chunk 61: 0.0100 - self_checking - 'I don't think I missed any.'
+    4. Chunk 98: 0.0100 - self_checking - '1105
+3. 1510
+4.'
+    5. Chunk 102: 0.0100 - uncertainty_management - 'Wait, that's 9 numbers, but only 5 of them are ...'
+    6. Chunk 125: 0.0100 - self_checking - 'Wait, but when I calculated the number of permu...'
+    7. Chunk 62: 0.0098 - self_checking - 'Let me try to list all possible four-digit numb...'
+    8. Chunk 1: 0.0000 - uncertainty_management - 'Hmm, okay.'
+    9. Chunk 2: 0.0000 - plan_generation - 'Let me think about this step by step.'
+    10. Chunk 5: 0.0000 - problem_setup - 'I need to rearrange these digits to form a four...'
+    11. Chunk 6: 0.0000 - fact_retrieval - 'Got it. Alright, so I remember that a number is...'
+    12. Chunk 7: 0.0000 - plan_generation - 'So, for the number I create, the units place mu...'
+    13. Chunk 8: 0.0000 - plan_generation - 'That gives me two cases to consider: numbers en...'
+    14. Chunk 9: 0.0000 - plan_generation - 'Let me handle each case separately.'
+    15. Chunk 10: 0.0000 - plan_generation - '**Case 1: Numbers ending with 0**'
+    16. Chunk 11: 0.0000 - fact_retrieval - 'If the last digit is 0, then the remaining thre...'
+    17. Chunk 12: 0.0000 - plan_generation - 'I need to find how many different ways I can ar...'
+    18. Chunk 13: 0.0000 - fact_retrieval - 'Wait, but I have two 1s and one 5.'
+    19. Chunk 14: 0.0000 - plan_generation - 'So, I need to calculate the number of unique pe...'
+    20. Chunk 15: 0.0000 - fact_retrieval - 'The formula for permutations of multiset is fac...'
+    21. Chunk 16: 0.0000 - active_computation - 'So, in this case, it's 3!'
+    22. Chunk 17: 0.0000 - active_computation - 'divided by 2!'
+    23. Chunk 19: 0.0000 - active_computation - 'Let me compute that:'
+    24. Chunk 20: 0.0000 - active_computation - '3! = 6
+2! = 2
+So, 6 / 2 = 3'
+    25. Chunk 21: 0.0000 - result_consolidation - 'Therefore, there are 3 unique ways to arrange 1...'
+    26. Chunk 22: 0.0000 - self_checking - 'Let me list them to make sure:'
+    27. Chunk 23: 0.0000 - self_checking - '- 1150
+- 1510
+- 5110'
+    28. Chunk 24: 0.0000 - self_checking - 'Yes, that seems right.'
+    29. Chunk 25: 0.0000 - result_consolidation - 'So, 3 numbers from this case.'
+    30. Chunk 26: 0.0000 - plan_generation - '**Case 2: Numbers ending with 5**'
+    31. Chunk 27: 0.0000 - fact_retrieval - 'Now, if the last digit is 5, then the remaining...'
+    32. Chunk 28: 0.0000 - plan_generation - 'Again, I need to arrange these three digits in ...'
+    33. Chunk 29: 0.0000 - fact_retrieval - 'But here, one of the digits is 0, which complic...'
+    34. Chunk 30: 0.0000 - plan_generation - 'So, I need to calculate the number of permutati...'
+    35. Chunk 31: 0.0000 - uncertainty_management - 'Let me think about how to approach this.'
+    36. Chunk 32: 0.0000 - fact_retrieval - 'First, without any restrictions, the number of ...'
+    37. Chunk 33: 0.0000 - active_computation - 'So, total permutations would be 3!'
+    38. Chunk 34: 0.0000 - active_computation - '/ 2! = 3. But some of these have 0 in the first...'
+    39. Chunk 36: 0.0000 - fact_retrieval - 'If 0 is fixed in the thousands place, then the ...'
+    40. Chunk 37: 0.0000 - active_computation - 'The number of ways to arrange these is 2!'
+    41. Chunk 38: 0.0000 - active_computation - '/ 2! = 1. So, there's only one such number: 011...'
+    42. Chunk 39: 0.0000 - active_computation - 'Therefore, the number of valid permutations is ...'
+    43. Chunk 40: 0.0000 - self_checking - 'Let me verify by listing them:'
+    44. Chunk 41: 0.0000 - self_checking - '- 1105
+- 1015'
+    45. Chunk 42: 0.0000 - uncertainty_management - 'Wait, hold on.'
+    46. Chunk 43: 0.0000 - uncertainty_management - 'Are these the only two?'
+    47. Chunk 44: 0.0000 - self_checking - 'Let me check.'
+    48. Chunk 45: 0.0000 - fact_retrieval - 'If I fix 5 in the units place, the first three ...'
+    49. Chunk 46: 0.0000 - fact_retrieval - 'Possible arrangements:'
+    50. Chunk 47: 0.0000 - self_checking - '1. 1, 1, 0 → 1105
+2.'
+    51. Chunk 48: 0.0000 - self_checking - '1, 0, 1 → 1015
+3.'
+    52. Chunk 49: 0.0000 - self_checking - '0, 1, 1 → 0115 (invalid)'
+    53. Chunk 50: 0.0000 - result_consolidation - 'So, yes, only two valid numbers: 1105 and 1015.'
+    54. Chunk 51: 0.0000 - result_consolidation - 'Therefore, Case 2 gives us 2 numbers.'
+    55. Chunk 52: 0.0000 - result_consolidation - '**Total number of valid four-digit multiples of...'
+    56. Chunk 53: 0.0000 - active_computation - 'Now, adding up the results from both cases:'
+    57. Chunk 54: 0.0000 - active_computation - 'Case 1: 3 numbers
+Case 2: 2 numbers'
+    58. Chunk 55: 0.0000 - active_computation - 'Total: 3 + 2 = 5'
+    59. Chunk 56: 0.0000 - uncertainty_management - 'Wait a minute, let me just make sure I didn't m...'
+    60. Chunk 57: 0.0000 - self_checking - 'For Case 1, ending with 0: 1150, 1510, 5110.'
+    61. Chunk 58: 0.0000 - self_checking - 'All four-digit, correct.'
+    62. Chunk 59: 0.0000 - self_checking - 'For Case 2, ending with 5: 1105, 1015.'
+    63. Chunk 60: 0.0000 - self_checking - 'Both four-digit, correct.'
+    64. Chunk 64: 0.0000 - self_checking - '1. 1150 – ends with 0, multiple of 5.'
+    65. Chunk 65: 0.0000 - self_checking - '2. 1105 – ends with 5, multiple of 5.'
+    66. Chunk 66: 0.0000 - self_checking - '3. 1510 – ends with 0, multiple of 5.'
+    67. Chunk 67: 0.0000 - self_checking - '4. 1501 – ends with 1, not multiple of 5.'
+    68. Chunk 68: 0.0000 - self_checking - '5. 1015 – ends with 5, multiple of 5.'
+    69. Chunk 69: 0.0000 - self_checking - '6. 1051 – ends with 1, not multiple of 5.'
+    70. Chunk 70: 0.0000 - self_checking - '7. 5110 – ends with 0, multiple of 5.'
+    71. Chunk 71: 0.0000 - self_checking - '8. 5101 – ends with 1, not multiple of 5.'
+    72. Chunk 72: 0.0000 - self_checking - '9. 5011 – ends with 1, not multiple of 5.'
+    73. Chunk 73: 0.0000 - self_checking - '10. 5011 – same as above.'
+    74. Chunk 74: 0.0000 - self_checking - '11. 0115 – starts with 0, invalid.'
+    75. Chunk 75: 0.0000 - self_checking - '12. 0151 – invalid.'
+    76. Chunk 76: 0.0000 - self_checking - '13. 0511 – invalid.'
+    77. Chunk 77: 0.0000 - self_checking - '14. 1015 – already listed.'
+    78. Chunk 78: 0.0000 - self_checking - '15. 1051 – already listed.'
+    79. Chunk 79: 0.0000 - self_checking - '16. 1105 – already listed.'
+    80. Chunk 80: 0.0000 - self_checking - '17. 1150 – already listed.'
+    81. Chunk 81: 0.0000 - self_checking - '18. 1501 – already listed.'
+    82. Chunk 82: 0.0000 - self_checking - '19. 1510 – already listed.'
+    83. Chunk 83: 0.0000 - self_checking - '20. 5011 – already listed.'
+    84. Chunk 84: 0.0000 - self_checking - '21. 5101 – already listed.'
+    85. Chunk 85: 0.0000 - self_checking - '22. 5110 – already listed.'
+    86. Chunk 86: 0.0000 - uncertainty_management - 'Wait, this is getting too long.'
+    87. Chunk 87: 0.0000 - self_checking - 'Let me count how many unique four-digit numbers...'
+    88. Chunk 88: 0.0000 - self_checking - '1. 1150
+2.'
+    89. Chunk 89: 0.0000 - self_checking - '1105
+3. 1510
+4.'
+    90. Chunk 90: 0.0000 - self_checking - '1501
+5. 1015
+6.'
+    91. Chunk 91: 0.0000 - self_checking - '1051
+7. 5110
+8.'
+    92. Chunk 92: 0.0000 - self_checking - '5101
+9. 5011
+10.'
+    93. Chunk 93: 0.0000 - self_checking - '0115 (invalid)
+11.'
+    94. Chunk 94: 0.0000 - self_checking - '0151 (invalid)
+12.'
+    95. Chunk 95: 0.0000 - self_checking - '0511 (invalid)'
+    96. Chunk 96: 0.0000 - self_checking - 'So, excluding the invalid ones (those starting ...'
+    97. Chunk 97: 0.0000 - self_checking - '1. 1150
+2.'
+    98. Chunk 100: 0.0000 - self_checking - '1051
+7. 5110
+8.'
+    99. Chunk 101: 0.0000 - self_checking - '5101
+9. 5011'
+    100. Chunk 104: 0.0000 - uncertainty_management - 'Hmm, what's going on here.'
+    101. Chunk 105: 0.0000 - self_checking - 'Wait, 1501 ends with 1, so it's not a multiple ...'
+    102. Chunk 106: 0.0000 - self_checking - 'Similarly, 1051 ends with 1.'
+    103. Chunk 107: 0.0000 - self_checking - '5011 ends with 1.'
+    104. Chunk 108: 0.0000 - self_checking - 'So, actually, only the numbers ending with 0 or...'
+    105. Chunk 109: 0.0000 - self_checking - 'So, from these 9 numbers, how many end with 0 o...'
+    106. Chunk 110: 0.0000 - self_checking - 'Looking at the list:'
+    107. Chunk 111: 0.0000 - self_checking - '1. 1150 – ends with 0
+2.'
+    108. Chunk 112: 0.0000 - self_checking - '1105 – ends with 5
+3.'
+    109. Chunk 113: 0.0000 - self_checking - '1510 – ends with 0
+4.'
+    110. Chunk 114: 0.0000 - self_checking - '1501 – ends with 1
+5.'
+    111. Chunk 115: 0.0000 - self_checking - '1015 – ends with 5
+6.'
+    112. Chunk 116: 0.0000 - self_checking - '1051 – ends with 1
+7.'
+    113. Chunk 117: 0.0000 - self_checking - '5110 – ends with 0
+8.'
+    114. Chunk 118: 0.0000 - self_checking - '5101 – ends with 1
+9.'
+    115. Chunk 119: 0.0000 - self_checking - '5011 – ends with 1'
+    116. Chunk 120: 0.0000 - self_checking - 'So, numbers 1,2,3,5,7 are multiples of 5.'
+    117. Chunk 121: 0.0000 - result_consolidation - 'That's 5 numbers.'
+    118. Chunk 122: 0.0000 - result_consolidation - 'So, my initial calculation was correct.'
+    119. Chunk 123: 0.0000 - final_answer_emission - 'So, the total number is 5.'
+    120. Chunk 124: 0.0000 - uncertainty_management - 'But when I listed all the possible four-digit n...'
+    121. Chunk 126: 0.0000 - self_checking - 'So, that matches.'
+    122. Chunk 127: 0.0000 - final_answer_emission - 'So, my initial answer was correct, 5.'
+    123. Chunk 128: 0.0000 - uncertainty_management - 'But just to make sure, let me recount.'
+    124. Chunk 129: 0.0000 - self_checking - 'Case 1: Numbers ending with 0.'
+    125. Chunk 130: 0.0000 - self_checking - 'Digits left: 1,1,5.'
+    126. Chunk 131: 0.0000 - self_checking - 'How many unique four-digit numbers?'
+    127. Chunk 132: 0.0000 - self_checking - 'They are: 1.'
+    128. Chunk 133: 0.0000 - self_checking - '1150
+2. 1510
+3.'
+    129. Chunk 134: 0.0000 - self_checking - '5110 So, 3 numbers.'
+    130. Chunk 135: 0.0000 - self_checking - 'Case 2: Numbers ending with 5.'
+    131. Chunk 136: 0.0000 - self_checking - 'Digits left: 1,1,0.'
+    132. Chunk 137: 0.0000 - self_checking - 'How many unique four-digit numbers?'
+    133. Chunk 138: 0.0000 - self_checking - 'They are: 1.'
+    134. Chunk 139: 0.0000 - self_checking - '1105
+2. 1015'
+    135. Chunk 140: 0.0000 - self_checking - 'So, 2 numbers.'
+    136. Chunk 141: 0.0000 - self_checking - 'Total: 3 + 2 = 5.'
+    137. Chunk 142: 0.0000 - self_checking - 'Yes, that's consistent.'
+    138. Chunk 143: 0.0000 - self_checking - 'So, I think my answer is correct.'
+    139. Chunk 144: 0.0000 - self_checking - 'But just to be thorough, let me list all the po...'
+    140. Chunk 145: 0.0000 - self_checking - '1. 1150 – yes
+2.'
+    141. Chunk 146: 0.0000 - self_checking - '1105 – yes
+3.'
+    142. Chunk 147: 0.0000 - self_checking - '1510 – yes
+4.'
+    143. Chunk 148: 0.0000 - self_checking - '1501 – no
+5.'
+    144. Chunk 149: 0.0000 - self_checking - '1015 – yes
+6.'
+    145. Chunk 150: 0.0000 - self_checking - '1051 – no
+7.'
+    146. Chunk 151: 0.0000 - self_checking - '5110 – yes
+8.'
+    147. Chunk 152: 0.0000 - self_checking - '5101 – no
+9.'
+    148. Chunk 153: 0.0000 - self_checking - '5011 – no
+10.'
+    149. Chunk 154: 0.0000 - self_checking - '0115 – invalid
+11.'
+    150. Chunk 155: 0.0000 - self_checking - '0151 – invalid
+12.'
+    151. Chunk 156: 0.0000 - self_checking - '0511 – invalid
+13.'
+    152. Chunk 157: 0.0000 - self_checking - '1015 – already listed
+14.'
+    153. Chunk 158: 0.0000 - self_checking - '1051 – already listed
+15.'
+    154. Chunk 159: 0.0000 - self_checking - '1105 – already listed
+16.'
+    155. Chunk 160: 0.0000 - self_checking - '1150 – already listed
+17.'
+    156. Chunk 161: 0.0000 - self_checking - '1501 – already listed
+18.'
+    157. Chunk 162: 0.0000 - self_checking - '1510 – already listed
+19.'
+    158. Chunk 163: 0.0000 - self_checking - '5011 – already listed
+20.'
+    159. Chunk 164: 0.0000 - self_checking - '5101 – already listed
+21.'
+    160. Chunk 165: 0.0000 - self_checking - '5110 – already listed'
+    161. Chunk 166: 0.0000 - result_consolidation - 'So, only numbers 1,2,3,5,7 are valid and multip...'
+    162. Chunk 167: 0.0000 - result_consolidation - 'That's 5 numbers.'
+    163. Chunk 168: 0.0000 - final_answer_emission - 'So, 5 is the correct answer.'
+    164. Chunk 169: 0.0000 - final_answer_emission - 'Therefore, my initial reasoning was correct.'
+    165. Chunk 103: -0.0105 - uncertainty_management - 'Wait, that contradicts my earlier conclusion.'
+    166. Chunk 99: -0.0108 - self_checking - '1501
+5. 1015
+6.'
+    167. Chunk 4: -0.0137 - fact_retrieval - 'The number given is 1150, so its digits are 1, ...'
+    168. Chunk 18: -0.0169 - fact_retrieval - '(because there are two 1s).'
+    169. Chunk 63: -0.0444 - self_checking - 'Possible four-digit numbers:'
+    170. Chunk 0: -0.6000 - problem_setup - 'Okay, so I have this problem: I need to figure ...'
+  Potential reasoning forks:
+    Fork 1: Chunks 1-169
+      Text: 'Hmm, okay. Let me think about this step by step. First, let me understand the problem clearly. I ...'
+      Tags: self_checking, plan_generation, uncertainty_management, result_consolidation, final_answer_emission, problem_setup, active_computation, fact_retrieval
+
