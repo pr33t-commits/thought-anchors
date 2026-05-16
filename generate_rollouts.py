@@ -97,9 +97,9 @@ if args.provider == "Local":
                                                         token=HF_KEY,
                                                         trust_remote_code=True,
                                                         use_fast=True,
-                                                        force_download=True,
-                                                        resume_download=False,
-                                                        cache_dir=safe_cache_path,   
+                                                        # force_download=True,
+                                                        # resume_download=False,
+                                                        # cache_dir=safe_cache_path,   
                                                     )
         print(type(local_tokenizer))
         print(local_tokenizer.vocab_size)
@@ -121,7 +121,7 @@ if args.provider == "Local":
                 torch_dtype=torch.float16,
                 token=HF_KEY,
                 trust_remote_code=True,
-                cache_dir=safe_cache_path,
+                # cache_dir=safe_cache_path,
             )
         else:
             
@@ -131,7 +131,7 @@ if args.provider == "Local":
                 torch_dtype=torch.float16 if torch.cuda.is_available() else None,
                 token = HF_KEY,
                 trust_remote_code=True,
-                cache_dir=safe_cache_path,
+                # cache_dir=safe_cache_path,
             )
         
         print("Local model loaded successfully")
@@ -247,8 +247,8 @@ async def make_api_request(prompt_dict: Dict, temperature: float, top_p: float, 
     """Make an API request to either Novita, Together, Fireworks, or use a local model based on provider setting."""
     # If using local model, use synchronous generation
     if args.provider == "Local":
-        return generate_with_local_model(prompt, temperature, top_p, max_tokens)
-    
+        batch_outputs = generate_with_local_model_batch(list(prompt_dict.values()), temperature, top_p, max_tokens)
+        return {prompt_id: output for prompt_id, output in zip(prompt_dict.keys(), batch_outputs)}
     # Otherwise, use API-based generation
     if args.provider == "Novita":
         # Novita API request
