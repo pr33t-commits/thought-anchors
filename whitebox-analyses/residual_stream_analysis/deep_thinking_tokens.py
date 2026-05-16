@@ -46,15 +46,18 @@ else:
 
 def analyze_residual_stream(model, chunk_info):
 
-    chunk_inputs = {problem:{chunk_id: chunk_dict["chunk_input"] for chunk_id, chunk_dict in chunks.items()} for problem, chunks in chunk_info.items()}
+    chunk_inputs = {problem:{chunk_id: {"chunk_input":chunk_dict["chunk_input"],
+                                        "chunk":chunk_dict["chunk"]} for chunk_id, chunk_dict in chunks.items()} for problem, chunks in chunk_info.items()}
     
     flat_inputs = []
     input_metadata = []
+    # chunks_removed = []
     print(chunk_inputs)
     for problem_id, chunks_dict in chunk_inputs.items():
-        for chunk_id, chunk_text in chunks_dict.items():
-            flat_inputs.append(chunk_text)
+        for chunk_id, chunk_input_plus_chunk in chunks_dict.items():
+            flat_inputs.append(chunk_input_plus_chunk['chunk_input'])
             input_metadata.append((problem_id, chunk_id))
+            # chunks_removed.append(chunk_input_plus_chunk['chunk'])
     print(flat_inputs)
     print(len(flat_inputs))
     batch_size = args.batch_size
@@ -65,12 +68,13 @@ def analyze_residual_stream(model, chunk_info):
         batch_end = min(batch_start + batch_size, len(flat_inputs))
         batch_inputs = flat_inputs[batch_start:batch_end]
         batch_meta = input_metadata[batch_start:batch_end]
+        # chunks = chunks_removed[batch_start:batch_end]
         
         print(f"Processing batch {batch_start // batch_size + 1} ({len(batch_inputs)} items)")
     
         logits, cache = model.run_with_cache(batch_inputs)
         logit_probs = logits.softmax(dim = -1)
-
+        
         # for h in ['unembed.hook_in', 'unembed.hook_out', 'hook_unembed']:
         #     print(f"Cache for hook {h}: {cache[h].shape}")
         # torch.testing.assert_close(cache['unembed.hook_out'], cache['hook_unembed'], rtol=1e-5, atol=1e-8)
@@ -83,25 +87,25 @@ def analyze_residual_stream(model, chunk_info):
         for problem_id, chunk_id in batch_meta:
             # final_layer_rs = cache["unembed.hook_out"]
             # model.cfg.n_layers - 1
-            distances = []
-            layers = []
-            for layer in range(10,12):
+            chunk_token_length = model.to_tokens(chunk_inputs[problem_id][chunk_id]['chunk']).shape[-1]
+            cache_results[problem_id][chunk_id] = {}
+            for layer in range(12,14):
                 layer_rs = cache[utils.get_act_name("resid_post", layer=layer)]
                 layer_logit_probs = torch.softmax(layer_rs @ W_U, dim =-1)
                 
                 # print(f'check:- {layer_logits.sum(dim = -1).sum()}')
                 # print(layer_logit_probs[:,-1,:].float().detach().numpy().shape)
                 # print(logit_probs.shape)
-                distance = jensenshannon(layer_logit_probs[:,-1,:].float().detach().numpy(), 
-                                        logit_probs[:,-1,:].float().detach().numpy(),base=2, axis = -1, keepdims=True)[:,-1]
+                distance = jensenshannon(layer_logit_probs[:,-(chunk_token_length + 1):-1,:].float().detach().numpy(), 
+                                        logit_probs[:,-(chunk_token_length + 1):-1,:].float().detach().numpy(),base=2, axis = -1, keepdims=True)#[:,-1]
                 print(f"Layer {layer} distance: {distance}")
-                layers.append(layer)
-                distances.append(distance)
+                # layers.append(layer)
+                # distances.append(distance)
                 # if layer < model.cfg.n_layers - 2:
                 #     layer_logit_next_probs = torch.softmax(cache[utils.get_act_name("resid_post", layer=layer + 1)] @ W_U, dim =-1)
                 #     print(jensenshannon(layer_logit_probs[:,-1,:].float().detach().numpy(), 
                 #                         layer_logit_next_probs[:,-1,:].float().detach().numpy(),base=2, axis = -1, keepdims=True)[:,-1])
-            cache_results[problem_id][chunk_id] = pd.DataFrame({"layer": layers, "js_distance": distances})
+                cache_results[problem_id][chunk_id][layer] = distance
     # cache_results[utils.get_act_name("resid_post")]
     
     return cache_results
