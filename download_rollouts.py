@@ -18,7 +18,7 @@ PRESETS = {
     },
     "vm": {
         "output_dir": Path("/mnt/math_rollouts"),
-        "path_contains": "problem_1591",
+        "path_contains": None,
         "model_path_contains": None,
     },
 }
