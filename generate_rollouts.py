@@ -103,6 +103,7 @@ if args.provider == "Local":
                                                     )
         print(type(local_tokenizer))
         print(local_tokenizer.vocab_size)
+        print(torch.cuda.is_available())
         # Load model with quantization if specified
         if args.quantize and torch.cuda.is_available():
             from transformers import BitsAndBytesConfig
@@ -230,7 +231,8 @@ def generate_with_local_model_batch(prompts: List[str], temperature: float, top_
                 input_length = len(input_ids)
                 
                 # Decode the generated text
-                generated_text = local_tokenizer.decode(output_ids[input_length:], skip_special_tokens=True)
+                output_text = local_tokenizer.decode(output_ids[input_length:], skip_special_tokens=True)
+                generated_text = output_text.replace("Ġ", " ").replace("Ċ", "\n")
                 
                 results.append({
                     "text": generated_text,
@@ -770,7 +772,7 @@ async def process_problems(problem_dict: Dict) -> None:
         # Get the source text for chunking
         source_text = base_solution_response["full_cot"]
         # print(f"Problem {problem_idx}: Using full CoT for chunking")
-        
+        print(f"Base solution full COT for problem {problem_idx}:\n{source_text}\n")
         # Extract the solution part for chunking
         if "<think>" in source_text:
             solution_text = source_text.split("<think>")[1].strip()
