@@ -22,7 +22,7 @@ PRESETS = {
         "device_map": None,
     },
     "vm": {
-        "chunk_input_dir": Path("/workspace/thought-anchors/math_rollouts"),
+        "chunk_input_dir": Path("math_rollouts"),
         "model": "deepseek-r1-distill-llama-8b",
         "hf_model": "deepseek-ai/DeepSeek-R1-Distill-Llama-8B",
         "device": None,
@@ -104,9 +104,11 @@ def analyze_residual_stream(model, chunk_info, batch_size):
     flat_inputs = []
     input_metadata = []
     for problem_id, chunks_dict in chunk_inputs.items():
-        for chunk_id, chunk_input_plus_chunk in chunks_dict.items():
-            flat_inputs.append(chunk_input_plus_chunk["chunk_input"])
-            input_metadata.append((problem_id, chunk_id))
+        flat_inputs.append(chunks_dict[len(chunks_dict) - 1]["chunk_input"])
+        input_metadata.append((problem_id, list(chunks_dict.keys())))
+        # for chunk_id, chunk_input_plus_chunk in chunks_dict.items():
+        #     # flat_inputs.append(chunk_input_plus_chunk["chunk_input"])
+        #     input_metadata.append((problem_id, chunk_id))
 
     cache_results = {problem_id: {} for problem_id in chunk_inputs.keys()}
 
@@ -121,22 +123,23 @@ def analyze_residual_stream(model, chunk_info, batch_size):
         logit_probs = logits.softmax(dim=-1)
         W_U = model.W_U
 
-        for batch_index, (problem_id, chunk_id) in enumerate(batch_meta):
-            chunk_token_length = model.to_tokens(chunk_inputs[problem_id][chunk_id]["chunk"]).shape[-1]
-            token_slice = slice(-(chunk_token_length + 1), -1)
-            cache_results[problem_id][chunk_id] = {}
+        for batch_index, (problem_id, chunk_id_list) in enumerate(batch_meta):
+            for chunk_id in chunk_id_list:
+                chunk_token_length = model.to_tokens(chunk_inputs[problem_id][chunk_id]["chunk"]).shape[-1]
+                token_slice = slice(-(chunk_token_length + 1), -1)
+                cache_results[problem_id][chunk_id] = {}
 
-            for layer in range(model.cfg.n_layers):
-                layer_rs = cache[utils.get_act_name("resid_post", layer=layer)]
-                layer_logit_probs = torch.softmax(layer_rs @ W_U, dim=-1)
-                distance = jensenshannon(
-                    layer_logit_probs[batch_index, token_slice, :].float().detach().cpu().numpy(),
-                    logit_probs[batch_index, token_slice, :].float().detach().cpu().numpy(),
-                    base=2,
-                    axis=-1,
-                    keepdims=True,
-                )
-                cache_results[problem_id][chunk_id][layer] = distance
+                for layer in range(model.cfg.n_layers):
+                    layer_rs = cache[utils.get_act_name("resid_post", layer=layer)]
+                    layer_logit_probs = torch.softmax(layer_rs @ W_U, dim=-1)
+                    distance = jensenshannon(
+                        layer_logit_probs[batch_index, token_slice, :].float().detach().cpu().numpy(),
+                        logit_probs[batch_index, token_slice, :].float().detach().cpu().numpy(),
+                        base=2,
+                        axis=-1,
+                        keepdims=True,
+                    )
+                    cache_results[problem_id][chunk_id][layer] = distance
 
     return cache_results
 
@@ -211,7 +214,7 @@ def load_chunk_outputs(input_dir: Path, problem_ids: List = None, chunk_ids: Dic
 
 def build_parser():
     parser = argparse.ArgumentParser(description="Residual stream analysis")
-    parser.add_argument("--preset", choices=PRESETS.keys(), default="local", help="Use local or vast.ai VM defaults.")
+    parser.add_argument("--preset", choices=PRESETS.keys(), default="vm", help="Use local or vast.ai VM defaults.")
     parser.add_argument("-m", "--model", type=str, default=None, help="Rollout model/deployment path in the data directory.")
     parser.add_argument("--hf_model", type=str, default=None, help="Hugging Face model id to load.")
     parser.add_argument("-b", "--base_solution_type", type=str, default="correct", choices=["correct", "incorrect"])
@@ -278,3 +281,6 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
+
