@@ -5,7 +5,9 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from dotenv import load_dotenv
+import time
 
+start = time.time()
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
@@ -26,7 +28,7 @@ PRESETS = {
         "model": "deepseek-r1-distill-llama-8b",
         "hf_model": "deepseek-ai/DeepSeek-R1-Distill-Llama-8B",
         "device": None,
-        "device_map": "auto",
+        "device_map": "cuda",
     },
 }
 
@@ -118,29 +120,32 @@ def analyze_residual_stream(model, chunk_info, batch_size):
         batch_meta = input_metadata[batch_start:batch_end]
 
         print(f"Processing batch {batch_start // batch_size + 1} ({len(batch_inputs)} items)", flush=True)
-
-        logits, cache = model.run_with_cache(batch_inputs)
-        logit_probs = logits.softmax(dim=-1)
-        W_U = model.W_U
-
-        for batch_index, (problem_id, chunk_id_list) in enumerate(batch_meta):
-            for chunk_id in chunk_id_list:
-                chunk_token_length = model.to_tokens(chunk_inputs[problem_id][chunk_id]["chunk"]).shape[-1]
-                token_slice = slice(-(chunk_token_length + 1), -1)
-                cache_results[problem_id][chunk_id] = {}
-
-                for layer in range(model.cfg.n_layers):
-                    layer_rs = cache[utils.get_act_name("resid_post", layer=layer)]
-                    layer_logit_probs = torch.softmax(layer_rs @ W_U, dim=-1)
-                    distance = jensenshannon(
-                        layer_logit_probs[batch_index, token_slice, :].float().detach().cpu().numpy(),
-                        logit_probs[batch_index, token_slice, :].float().detach().cpu().numpy(),
-                        base=2,
-                        axis=-1,
-                        keepdims=True,
-                    )
-                    cache_results[problem_id][chunk_id][layer] = distance
-
+        with torch.inference_mode():
+            logits, cache = model.run_with_cache(batch_inputs,
+                                                names_filter=lambda name: name.endswith("hook_resid_post"))
+            print(f"Batch Processing time: {time.time()-start:.2f}s")
+            logit_probs = logits.softmax(dim=-1)
+    
+            for batch_index, (problem_id, chunk_id_list) in enumerate(batch_meta):
+                for chunk_id in chunk_id_list:
+                    chunk_token_length = model.to_tokens(chunk_inputs[problem_id][chunk_id]["chunk"]).shape[-1]
+                    chunk_input_length = model.to_tokens(chunk_inputs[problem_id][chunk_id]["chunk_input"]).shape[-1]
+                    token_slice = slice((chunk_input_length - chunk_token_length - 1), chunk_input_length - 1)
+                    cache_results[problem_id][chunk_id] = {}
+    
+                    for layer in range(model.cfg.n_layers):
+                        layer_rs = cache[utils.get_act_name("resid_post", layer=layer)]
+                        layer_logit_probs = torch.softmax(layer_rs @ model.W_U, dim=-1)
+                        distance = jensenshannon(
+                            layer_logit_probs[batch_index, token_slice, :].float().detach().cpu().numpy(),
+                            logit_probs[batch_index, token_slice, :].float().detach().cpu().numpy(),
+                            base=2,
+                            axis=-1,
+                            keepdims=True,
+                        )
+                        cache_results[problem_id][chunk_id][layer] = distance
+                        print(f"Layer {layer}: {time.time()-start:.2f}s")
+                        start = time.time()
     return cache_results
 
 
@@ -225,7 +230,7 @@ def build_parser():
     parser.add_argument("-cid", "--chunk_input_dir", type=Path, default=None, help="Root directory to read chunk outputs from.")
     parser.add_argument("--input_dir", type=Path, default=None, help="Full resolved input directory. Overrides -cid/-m/-t/-tp.")
     parser.add_argument("-is", "--input_exp_suffix", type=str, default=None)
-    parser.add_argument("-bs", "--batch_size", type=int, default=2)
+    parser.add_argument("-bs", "--batch_size", type=int, default=1)
     parser.add_argument("--chunks_to_include", type=Path, default=SCRIPT_DIR / "input_args" / "chunks_to_include.json")
     parser.add_argument("--output", type=Path, default=SCRIPT_DIR / "Results" / "deep_thinking_tokens_distances.json")
     parser.add_argument("--device", type=str, default=None, help="Device for local model loading, e.g. cpu or cuda.")
