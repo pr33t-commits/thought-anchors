@@ -2,15 +2,20 @@ import argparse
 import json
 import os
 from pathlib import Path
-from typing import Any, Dict, List, Optional
 
+print(Path(__file__))
+print(Path(__file__).resolve().parent)
+
+from typing import Any, Dict, List, Optional
+from utils import jensenshannon_pt
 from dotenv import load_dotenv
 import time
 
-start = time.time()
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
+
+
 
 load_dotenv(PROJECT_ROOT / ".env")
 
@@ -55,7 +60,10 @@ def parse_dtype(dtype_name: str):
 
 def to_jsonable(value: Any) -> Any:
     import numpy as np
+    import torch
 
+    if isinstance(value, torch.Tensor):
+        return value.detach().cpu().float().numpy().tolist()
     if isinstance(value, np.ndarray):
         return value.tolist()
     if isinstance(value, np.generic):
@@ -65,7 +73,6 @@ def to_jsonable(value: Any) -> Any:
     if isinstance(value, (list, tuple)):
         return [to_jsonable(item) for item in value]
     return value
-
 
 def build_chunks_input_dir(args: argparse.Namespace) -> Path:
     chunk_input_dir = args.chunk_input_dir or PRESETS[args.preset]["chunk_input_dir"]
@@ -89,7 +96,7 @@ def build_chunks_input_dir(args: argparse.Namespace) -> Path:
 
 def analyze_residual_stream(model, chunk_info, batch_size):
     import torch
-    from scipy.spatial.distance import jensenshannon
+    # from scipy.spatial.distance import jensenshannon
     from transformer_lens import utils
 
     chunk_inputs = {
@@ -108,9 +115,6 @@ def analyze_residual_stream(model, chunk_info, batch_size):
     for problem_id, chunks_dict in chunk_inputs.items():
         flat_inputs.append(chunks_dict[len(chunks_dict) - 1]["chunk_input"])
         input_metadata.append((problem_id, list(chunks_dict.keys())))
-        # for chunk_id, chunk_input_plus_chunk in chunks_dict.items():
-        #     # flat_inputs.append(chunk_input_plus_chunk["chunk_input"])
-        #     input_metadata.append((problem_id, chunk_id))
 
     cache_results = {problem_id: {} for problem_id in chunk_inputs.keys()}
 
@@ -120,14 +124,17 @@ def analyze_residual_stream(model, chunk_info, batch_size):
         batch_meta = input_metadata[batch_start:batch_end]
 
         print(f"Processing batch {batch_start // batch_size + 1} ({len(batch_inputs)} items)", flush=True)
+        batch_time = time.time()
         with torch.inference_mode():
             logits, cache = model.run_with_cache(batch_inputs,
                                                 names_filter=lambda name: name.endswith("hook_resid_post"))
-            print(f"Batch Processing time: {time.time()-start:.2f}s")
+            print(f"Batch Processing time: {time.time()-batch_time:.2f}s")
             logit_probs = logits.softmax(dim=-1)
-    
+            del logits
+            
             for batch_index, (problem_id, chunk_id_list) in enumerate(batch_meta):
                 for chunk_id in chunk_id_list:
+                    chunk_start_time = time.time()
                     chunk_token_length = model.to_tokens(chunk_inputs[problem_id][chunk_id]["chunk"]).shape[-1]
                     chunk_input_length = model.to_tokens(chunk_inputs[problem_id][chunk_id]["chunk_input"]).shape[-1]
                     token_slice = slice((chunk_input_length - chunk_token_length - 1), chunk_input_length - 1)
@@ -135,17 +142,22 @@ def analyze_residual_stream(model, chunk_info, batch_size):
     
                     for layer in range(model.cfg.n_layers):
                         layer_rs = cache[utils.get_act_name("resid_post", layer=layer)]
-                        layer_logit_probs = torch.softmax(layer_rs @ model.W_U, dim=-1)
-                        distance = jensenshannon(
-                            layer_logit_probs[batch_index, token_slice, :].float().detach().cpu().numpy(),
-                            logit_probs[batch_index, token_slice, :].float().detach().cpu().numpy(),
+                        
+                        # FIX 1: Apply final LayerNorm and unembedding correctly                        
+                        layer_logits = model.unembed(model.ln_final(layer_rs))
+                        
+                        layer_logit_probs = torch.softmax(layer_logits, dim=-1)
+                        del layer_logits, layer_rs
+                        
+                        distance = jensenshannon_pt(
+                            layer_logit_probs[batch_index, token_slice, :],
+                            logit_probs[batch_index, token_slice, :],
                             base=2,
-                            axis=-1,
-                            keepdims=True,
+                            dim=-1
                         )
+                        
                         cache_results[problem_id][chunk_id][layer] = distance
-                        print(f"Layer {layer}: {time.time()-start:.2f}s")
-                        start = time.time()
+                    print(f"Chunk {chunk_id}: {time.time()-chunk_start_time:.2f}s")
     return cache_results
 
 
@@ -243,6 +255,9 @@ def build_parser():
 
 def main():
     args = build_parser().parse_args()
+
+    
+    start = time.time()
 
     from transformer_lens.model_bridge import TransformerBridge
 

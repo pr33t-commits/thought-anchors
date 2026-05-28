@@ -17,7 +17,7 @@ PRESETS = {
         "model_path_contains": "deepseek-r1-distill-qwen-14b",
     },
     "vm": {
-        "output_dir": Path("/mnt/math_rollouts"),
+        "output_dir": Path("math_rollouts"),
         "path_contains": None,
         "model_path_contains": None,
     },
@@ -26,7 +26,7 @@ PRESETS = {
 
 def build_parser():
     parser = argparse.ArgumentParser(description="Download math rollout files.")
-    parser.add_argument("--preset", choices=PRESETS.keys(), default="local", help="Use local or vast.ai VM defaults.")
+    parser.add_argument("--preset", choices=PRESETS.keys(), default="vm", help="Use local or vast.ai VM defaults.")
     parser.add_argument("--dataset", default="uzaymacar/math-rollouts", help="Hugging Face dataset name.")
     parser.add_argument("--split", default="default", help="Dataset split to stream.")
     parser.add_argument("--output-dir", type=Path, default=None, help="Directory where rollout files are written.")
