@@ -94,7 +94,7 @@ def build_chunks_input_dir(args: argparse.Namespace) -> Path:
     return chunks_input_dir / dir_name
 
 
-def analyze_residual_stream(model, chunk_info, batch_size):
+def analyze_residual_stream(model, chunk_info, batch_size, output_dir):
     import torch
     # from scipy.spatial.distance import jensenshannon
     from transformer_lens import utils
@@ -117,6 +117,16 @@ def analyze_residual_stream(model, chunk_info, batch_size):
         input_metadata.append((problem_id, list(chunks_dict.keys())))
 
     cache_results = {problem_id: {} for problem_id in chunk_inputs.keys()}
+    token_lengths = {
+        problem_id: {
+            chunk_id: {
+                "chunk": model.to_tokens(chunk["chunk"]).shape[-1],
+                "chunk_input": model.to_tokens(chunk["chunk_input"]).shape[-1],
+            }
+            for chunk_id, chunk in chunks.items()
+        }
+        for problem_id, chunks in chunk_inputs.items()
+    }
 
     for batch_start in range(0, len(flat_inputs), batch_size):
         batch_end = min(batch_start + batch_size, len(flat_inputs))
@@ -129,19 +139,20 @@ def analyze_residual_stream(model, chunk_info, batch_size):
             logits, cache = model.run_with_cache(batch_inputs,
                                                 names_filter=lambda name: name.endswith("hook_resid_post"))
             print(f"Batch Processing time: {time.time()-batch_time:.2f}s")
-            logit_probs = logits.softmax(dim=-1)
-            del logits
+            # logit_probs = logits.softmax(dim=-1)
+            # del logits
             
             for batch_index, (problem_id, chunk_id_list) in enumerate(batch_meta):
                 for chunk_id in chunk_id_list:
                     chunk_start_time = time.time()
-                    chunk_token_length = model.to_tokens(chunk_inputs[problem_id][chunk_id]["chunk"]).shape[-1]
-                    chunk_input_length = model.to_tokens(chunk_inputs[problem_id][chunk_id]["chunk_input"]).shape[-1]
+                    chunk_token_length = token_lengths[problem_id][chunk_id]["chunk"]
+                    chunk_input_length = token_lengths[problem_id][chunk_id]["chunk_input"]
                     token_slice = slice((chunk_input_length - chunk_token_length - 1), chunk_input_length - 1)
                     cache_results[problem_id][chunk_id] = {}
-    
+                    final_logit_probs = logits[batch_index, token_slice, :].softmax(dim=-1)
+                    
                     for layer in range(model.cfg.n_layers):
-                        layer_rs = cache[utils.get_act_name("resid_post", layer=layer)]
+                        layer_rs = layer_rs = cache[utils.get_act_name("resid_post", layer=layer)][batch_index, token_slice, :]
                         
                         # FIX 1: Apply final LayerNorm and unembedding correctly                        
                         layer_logits = model.unembed(model.ln_final(layer_rs))
@@ -150,14 +161,23 @@ def analyze_residual_stream(model, chunk_info, batch_size):
                         del layer_logits, layer_rs
                         
                         distance = jensenshannon_pt(
-                            layer_logit_probs[batch_index, token_slice, :],
-                            logit_probs[batch_index, token_slice, :],
+                            layer_logit_probs,
+                            final_logit_probs,
                             base=2,
                             dim=-1
                         )
                         
-                        cache_results[problem_id][chunk_id][layer] = distance
-                    print(f"Chunk {chunk_id}: {time.time()-chunk_start_time:.2f}s")
+                        cache_results[problem_id][chunk_id][layer] = distance.detach().cpu().float()
+                        del distance, layer_logit_probs
+                    if chunk_id % 25 == 0:
+                        print(f"Chunk {chunk_id}: {time.time()-chunk_start_time:.2f}s")
+                    del final_logit_probs
+            del cache, logits
+            
+        with open(output_dir, "w", encoding="utf-8") as f:
+                json.dump(to_jsonable(cache_results), f, indent=2)
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
     return cache_results
 
 
@@ -225,6 +245,8 @@ def load_chunk_outputs(input_dir: Path, problem_ids: List = None, chunk_ids: Dic
                 if part
             )
             chunk_importance_dict[problem][chunk_id] = chunk_obj
+        
+       
 
     return chunk_importance_dict
 
@@ -290,9 +312,12 @@ def main():
 
     print(f"Loading model {hf_model}", flush=True)
     bridge = TransformerBridge.boot_transformers(hf_model, **model_kwargs)
-    importance_results = analyze_residual_stream(bridge, chunk_outputs, args.batch_size)
 
     args.output.parent.mkdir(parents=True, exist_ok=True)
+    
+    importance_results = analyze_residual_stream(bridge, chunk_outputs, args.batch_size, output_dir = args.output)
+
+    # args.output.parent.mkdir(parents=True, exist_ok=True)
     with open(args.output, "w", encoding="utf-8") as f:
         json.dump(to_jsonable(importance_results), f, indent=2)
 

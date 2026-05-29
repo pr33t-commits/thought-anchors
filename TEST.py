@@ -14,12 +14,12 @@ quantization_config = BitsAndBytesConfig(
 
 # Method 1: Simple loading (recommended)
 bridge = TransformerBridge.boot_transformers(
-    "deepseek-ai/DeepSeek-R1-Distill-Llama-8B",
+    "deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B",
     # token=HF_KEY,
     device="cpu",  # or "cpu"
-    dtype=torch.float16,
+    # dtype=torch.float16,
     trust_remote_code=False,  # Usually not needed for official models
-    quantization_config=quantization_config,
+    # quantization_config=quantization_config,
 )
 
 # # Test basic forward pass
@@ -33,4 +33,10 @@ bridge = TransformerBridge.boot_transformers(
 
 # Test run_with_cache (for mechanistic interpretability)
 logits, cache = bridge.run_with_cache("The meaning of life is")
-print(f"Cache keys: {cache.keys()}")
+# print(f"Cache keys: {cache.keys()}")
+
+# logits.shape
+
+torch.softmax(logits[0], dim=-1)
+
+bridge.layer_types
