@@ -17,7 +17,7 @@ PRESETS = {
         "model_path_contains": "deepseek-r1-distill-qwen-14b",
     },
     "vm": {
-        "output_dir": Path("math_rollouts"),
+        "output_dir": Path("/home/lodaya_dimpal/storage/math_rollouts"),
         "path_contains": None,
         "model_path_contains": None,
     },

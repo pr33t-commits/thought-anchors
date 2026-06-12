@@ -29,7 +29,7 @@ PRESETS = {
         "device_map": None,
     },
     "vm": {
-        "chunk_input_dir": Path("math_rollouts"),
+        "chunk_input_dir": Path("/home/lodaya_dimpal/storage/math_rollouts"),
         "model": "deepseek-r1-distill-llama-8b",
         "hf_model": "deepseek-ai/DeepSeek-R1-Distill-Llama-8B",
         "device": None,
@@ -266,7 +266,7 @@ def build_parser():
     parser.add_argument("-is", "--input_exp_suffix", type=str, default=None)
     parser.add_argument("-bs", "--batch_size", type=int, default=1)
     parser.add_argument("--chunks_to_include", type=Path, default=SCRIPT_DIR / "input_args" / "chunks_to_include.json")
-    parser.add_argument("--output", type=Path, default=SCRIPT_DIR / "Results" / "deep_thinking_tokens_distances.json")
+    parser.add_argument("--output", type=Path, default=Path("/home/lodaya_dimpal/storage/Results/deep_thinking_tokens_distances.json"))
     parser.add_argument("--device", type=str, default=None, help="Device for local model loading, e.g. cpu or cuda.")
     parser.add_argument("--device_map", type=str, default=None, help="Device map for VM/GPU loading, e.g. auto.")
     parser.add_argument("--dtype", type=str, default="bfloat16", choices=["bf16", "bfloat16", "fp16", "float16", "fp32", "float32"])
