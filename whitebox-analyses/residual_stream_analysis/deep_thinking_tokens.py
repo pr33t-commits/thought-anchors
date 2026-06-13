@@ -136,6 +136,9 @@ def analyze_residual_stream(model, chunk_info, batch_size, output_dir):
         print(f"Processing batch {batch_start // batch_size + 1} ({len(batch_inputs)} items)", flush=True)
         batch_time = time.time()
         with torch.inference_mode():
+            # print(batch_inputs[0])
+            print("Problem ids in batch:", [meta[0] for meta in batch_meta])
+            print("input lengths:", [model.to_tokens(input).shape for input in batch_inputs])
             logits, cache = model.run_with_cache(batch_inputs,
                                                 names_filter=lambda name: name.endswith("hook_resid_post"))
             print(f"Batch Processing time: {time.time()-batch_time:.2f}s")
@@ -173,6 +176,8 @@ def analyze_residual_stream(model, chunk_info, batch_size, output_dir):
                         print(f"Chunk {chunk_id}: {time.time()-chunk_start_time:.2f}s")
                     del final_logit_probs
             del cache, logits
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
             
         with open(output_dir, "w", encoding="utf-8") as f:
                 json.dump(to_jsonable(cache_results), f, indent=2)
@@ -253,7 +258,7 @@ def load_chunk_outputs(input_dir: Path, problem_ids: List = None, chunk_ids: Dic
 
 def build_parser():
     parser = argparse.ArgumentParser(description="Residual stream analysis")
-    parser.add_argument("--preset", choices=PRESETS.keys(), default="vm", help="Use local or vast.ai VM defaults.")
+    parser.add_argument("--preset", choices=PRESETS.keys(), default="local", help="Use local or vast.ai VM defaults.")
     parser.add_argument("-m", "--model", type=str, default=None, help="Rollout model/deployment path in the data directory.")
     parser.add_argument("--hf_model", type=str, default=None, help="Hugging Face model id to load.")
     parser.add_argument("-b", "--base_solution_type", type=str, default="correct", choices=["correct", "incorrect"])
@@ -329,3 +334,4 @@ if __name__ == "__main__":
 
 
 
+# pip install -U bitsandbytes>=0.46.1
