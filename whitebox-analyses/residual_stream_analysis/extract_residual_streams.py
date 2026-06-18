@@ -285,7 +285,7 @@ def write_output(path: Path, output: Dict[str, Dict[str, Dict[str, Dict[int, Any
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Extract residual stream vectors for chunk-level linear probes.")
-    parser.add_argument("--preset", choices=PRESETS.keys(), default="local", help="Use local or vast.ai VM defaults.")
+    parser.add_argument("--preset", choices=PRESETS.keys(), default="vm", help="Use local or vast.ai VM defaults.")
     parser.add_argument("-m", "--model", type=str, default=None, help="Rollout model/deployment path in the data directory.")
     parser.add_argument("--hf_model", type=str, default=None, help="Hugging Face model id to load.")
     parser.add_argument("-b", "--base_solution_type", type=str, default="correct", choices=["correct", "incorrect"])
@@ -318,7 +318,7 @@ def main() -> None:
     chunks_filtering_dict = load_chunks_to_include(args.chunks_to_include)
     output_path = args.output or PRESETS[args.preset]["output"]
 
-    hf_model = "deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B"#args.hf_model or PRESETS[args.preset]["hf_model"]
+    hf_model = args.hf_model or PRESETS[args.preset]["hf_model"] #"deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B"#args.hf_model or PRESETS[args.preset]["hf_model"]
     device = args.device if args.device is not None else PRESETS[args.preset]["device"]
     device_map = args.device_map if args.device_map is not None else PRESETS[args.preset]["device_map"]
 

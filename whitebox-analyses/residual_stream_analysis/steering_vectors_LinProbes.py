@@ -141,7 +141,6 @@ def vector_to_1d(vector: Any, pool: str) -> np.ndarray:
         raise ValueError("Residual stream vector contains NaN or infinite values.")
     return arr
 
-
 def load_problem_labels(labels_root: Path, problem_id: str) -> Dict[int, List[str]]:
     labels_path = labels_root / f"problem_{problem_id}" / "chunks_labeled.json"
     if not labels_path.is_file():
@@ -155,7 +154,6 @@ def load_problem_labels(labels_root: Path, problem_id: str) -> Dict[int, List[st
             tags = [tags]
         labels[chunk_id] = [str(tag) for tag in tags if str(tag)]
     return labels
-
 
 def build_examples(
     residual_path: Path,
@@ -236,7 +234,6 @@ def make_probe():
             ),
         ]
     )
-
 
 def evaluate_probe(
     probe_key: Tuple[str, str],
