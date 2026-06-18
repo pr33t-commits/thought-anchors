@@ -13,8 +13,8 @@ load_dotenv(PROJECT_ROOT / ".env")
 PRESETS = {
     "local": {
         "output_dir": PROJECT_ROOT / "math_rollouts",
-        "path_contains": "problem_1591",
-        "model_path_contains": "deepseek-r1-distill-qwen-14b",
+        "path_contains": None,
+        "model_path_contains": "deepseek-r1-distill-llama-8b",
     },
     "vm": {
         "output_dir": Path("/home/lodaya_dimpal/storage/math_rollouts"),
