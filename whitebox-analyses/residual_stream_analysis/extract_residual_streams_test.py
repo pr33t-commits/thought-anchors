@@ -4,6 +4,7 @@ import os
 import re
 import time
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, Dict, List, Optional, Tuple
 
 from dotenv import load_dotenv
@@ -22,28 +23,17 @@ PRESETS = {
         "hf_model": "deepseek-ai/DeepSeek-R1-Distill-Llama-8B",
         "device": "cpu",
         "device_map": None,
-        "output_dir": SCRIPT_DIR / "Inputs",
+        "output": SCRIPT_DIR / "Input" / "residual_stream_extracts.json",
     },
     "vm": {
-        "chunk_input_dir": Path("/home/lodaya_dimpal/storage/math_rollouts"),
+        "chunk_input_dir": Path("/workspace/math_rollouts"),
         "model": "deepseek-r1-distill-llama-8b",
         "hf_model": "deepseek-ai/DeepSeek-R1-Distill-Llama-8B",
         "device": None,
         "device_map": "cuda",
-        "output_dir": Path("/home/lodaya_dimpal/storage/residual_stream_analysis/Inputs"),
+        "output": Path("/home/lodaya_dimpal/storage/residual_stream_analysis/Input/residual_stream_extracts.json"),
     },
 }
-
-DEFAULT_RESIDUAL_FILE = "residual_stream_extracts.json"
-
-
-def log_problem_timing(problem_id: str, step: str, elapsed: float) -> None:
-    print(f"problem_{problem_id} timing: {step}={elapsed:.2f}s", flush=True)
-
-
-def synchronize_cuda(torch_module) -> None:
-    if torch_module.cuda.is_available():
-        torch_module.cuda.synchronize()
 
 
 def parse_problem_ids(problem_ids: Optional[str]) -> Optional[List[str]]:
@@ -140,8 +130,10 @@ def find_chunk_char_spans(full_text: str, prompt: str, chunks: List[str]) -> Lis
     spans = []
     search_start = len(prompt)
     for chunk_idx, chunk in enumerate(chunks):
+        
         start = full_text.find(chunk, search_start)
         if start != -1:
+            
             end = start + len(chunk)
         else:
             pieces = [re.escape(piece) for piece in re.split(r"\s+", chunk.strip()) if piece]
@@ -160,6 +152,17 @@ def find_chunk_char_spans(full_text: str, prompt: str, chunks: List[str]) -> Lis
             raise ValueError(f"Could not align chunk {chunk_idx}: {chunk[:80]!r}")
         spans.append((start, end))
         search_start = end
+        # if chunk_idx in [72,"72"]:
+        #     print(f"Chunk {chunk_idx} span: {start}-{end}")
+        #     print(chunk)
+        #     print(full_text.find(chunk, search_start))
+        if chunk_idx % 12 == 0:
+            # print(full_text.find(chunk, search_start))
+            
+            print(chunk_idx)
+            print(start, end)
+            # print(chunk[:50])
+            print(full_text[start:end])
     return spans
 
 
@@ -187,6 +190,133 @@ def tokenize_with_offsets(model, text: str):
     return input_ids, offsets
 
 
+def display_slice(text: str, start: int, end: int) -> str:
+    return (
+        repr(text[start:end])
+        .replace("\\r", "<CR>")
+        .replace("\\n", "<NL>")
+        .replace("\\t", "<TAB>")
+    )
+
+
+def print_token_window(
+    tokenizer,
+    input_ids,
+    offsets: List[Tuple[int, int]],
+    text: str,
+    start: int,
+    count: int,
+) -> None:
+    end = min(start + count, len(offsets))
+    print(f"Token window [{start}:{end}]", flush=True)
+    for token_idx in range(start, end):
+        token_id = int(input_ids[0, token_idx].item())
+        token_text = tokenizer.convert_ids_to_tokens(token_id)
+        token_start, token_end = offsets[token_idx]
+        print(
+            token_idx,
+            token_id,
+            repr(token_text),
+            (token_start, token_end),
+            display_slice(text, token_start, token_end),
+            flush=True,
+        )
+
+
+def print_offset_anomalies(
+    tokenizer,
+    input_ids,
+    offsets: List[Tuple[int, int]],
+    text: str,
+    limit: int,
+) -> None:
+    printed = 0
+    for token_idx in range(1, len(offsets)):
+        prev_start, prev_end = offsets[token_idx - 1]
+        token_start, token_end = offsets[token_idx]
+        if prev_end == token_start:
+            continue
+
+        relation = "gap" if token_start > prev_end else "overlap"
+        print(
+            f"{relation} before token {token_idx}: "
+            f"prev={(prev_start, prev_end)} current={(token_start, token_end)} "
+            f"between={display_slice(text, min(prev_end, token_start), max(prev_end, token_start))}",
+            flush=True,
+        )
+        window_start = max(0, token_idx - 3)
+        print_token_window(tokenizer, input_ids, offsets, text, window_start, 7)
+        printed += 1
+        if printed >= limit:
+            break
+
+    if printed == 0:
+        print("No offset gaps/overlaps found.", flush=True)
+
+
+def print_chunk_alignment_debug(
+    tokenizer,
+    input_ids,
+    offsets: List[Tuple[int, int]],
+    text: str,
+    chunk_idx: int,
+    chunk_start: int,
+    chunk_end: int,
+) -> None:
+    before = [
+        token_idx
+        for token_idx, (_, token_end) in enumerate(offsets)
+        if token_end <= chunk_start
+    ]
+    after = [
+        token_idx
+        for token_idx, (token_start, _) in enumerate(offsets)
+        if token_start >= chunk_end
+    ]
+    crossing = [
+        token_idx
+        for token_idx, (token_start, token_end) in enumerate(offsets)
+        if token_start <= chunk_start and token_end >= chunk_end
+    ]
+
+    print(f"Chunk {chunk_idx} alignment debug", flush=True)
+    print(f"Chunk span: {(chunk_start, chunk_end)} length={chunk_end - chunk_start}", flush=True)
+    print(f"Chunk text: {display_slice(text, chunk_start, chunk_end)}", flush=True)
+    print(
+        "Context: "
+        f"{display_slice(text, max(0, chunk_start - 120), min(len(text), chunk_end + 120))}",
+        flush=True,
+    )
+    print(f"Crossing tokens covering whole chunk: {crossing[-10:]}", flush=True)
+
+    if before:
+        print("Nearest tokens before/at chunk start:", flush=True)
+        print_token_window(tokenizer, input_ids, offsets, text, max(0, before[-1] - 5), 8)
+    else:
+        print("No tokens end before/at chunk start.", flush=True)
+
+    if after:
+        print("Nearest tokens after/at chunk end:", flush=True)
+        print_token_window(tokenizer, input_ids, offsets, text, max(0, after[0] - 3), 8)
+    else:
+        print("No tokens start after/at chunk end.", flush=True)
+
+    around_start = [
+        token_idx
+        for token_idx, (token_start, token_end) in enumerate(offsets)
+        if chunk_start - 200 <= token_start <= chunk_start + 200
+        or chunk_start - 200 <= token_end <= chunk_start + 200
+    ]
+    around_end = [
+        token_idx
+        for token_idx, (token_start, token_end) in enumerate(offsets)
+        if chunk_end - 200 <= token_start <= chunk_end + 200
+        or chunk_end - 200 <= token_end <= chunk_end + 200
+    ]
+    print(f"Token indices with offsets near chunk start: {around_start[:40]}", flush=True)
+    print(f"Token indices with offsets near chunk end: {around_end[:40]}", flush=True)
+
+
 def token_indices_overlapping_span(offsets: List[Tuple[int, int]], start: int, end: int) -> List[int]:
     return [
         index
@@ -196,7 +326,7 @@ def token_indices_overlapping_span(offsets: List[Tuple[int, int]], start: int, e
 
 
 def last_token_before_span(offsets: List[Tuple[int, int]], start: int) -> Optional[int]:
-    previous = [index for index, (_, token_end) in enumerate(offsets) if token_end < start]
+    previous = [index for index, (_, token_end) in enumerate(offsets) if token_end <= start]
     if previous:
         return previous[-1]
     return None
@@ -208,57 +338,69 @@ def extract_problem_residuals(
     problem_id: str,
     chunks_to_include: Optional[List[int]] = None,
 ) -> Dict[str, Dict[int, Dict[int, Any]]]:
-    import torch
-    from transformer_lens import utilities
-
-    step_start = time.perf_counter()
     base_solution, chunks = load_problem(problem_dir)
-    log_problem_timing(problem_id, "load_problem_files", time.perf_counter() - step_start)
-
-    step_start = time.perf_counter()
     prompt = base_solution["prompt"]
     full_text = base_solution.get("full_cot") or f"{prompt}{base_solution['solution']}"
     spans = find_chunk_char_spans(full_text, prompt, chunks)
-    log_problem_timing(problem_id, "align_chunk_spans", time.perf_counter() - step_start)
-
-    synchronize_cuda(torch)
-    step_start = time.perf_counter()
     input_ids, offsets = tokenize_with_offsets(model, full_text)
-    synchronize_cuda(torch)
-    log_problem_timing(problem_id, "tokenize_with_offsets", time.perf_counter() - step_start)
 
-    synchronize_cuda(torch)
-    step_start = time.perf_counter()
-    with torch.inference_mode():
-        _, cache = model.run_with_cache(
-            input_ids,
-            names_filter=lambda name: name.endswith("hook_resid_post"),
-        )
-    synchronize_cuda(torch)
-    log_problem_timing(problem_id, "model_run_with_cache", time.perf_counter() - step_start)
+    # with torch.inference_mode():
+    #     _, cache = model.run_with_cache(
+    #         input_ids,
+    #         names_filter=lambda name: name.endswith("hook_resid_post"),
+    #     )
+    # sum1 = 0
+    # sum2 = 0
+    # for f in offsets:
+    #     sum1 += f[1] - f[0] + 1
+    #     sum2 += max(f[1], f[0]) - min(f[1], f[0]) + 1
+    # print(f"Sum of offset lengths: {sum1}, sum of max-min lengths: {sum2}, difference: {sum2 - sum1}")
 
+    covered = set()
+    for s, e in offsets:
+        covered.update(range(s, e))  # no +1
+
+    missing = [i for i in range(offsets[0][0], offsets[-1][1]) if i not in covered]
+
+    print("covered chars:", len(covered))
+    print("span length:", offsets[-1][1] - offsets[0][0])
+    print("missing chars:", len(missing))
+    print("first missing:", missing[:20])
+    
     problem_results = {
         "mean_vector": {},
         "last_token_vector": {},
     }
     allowed_chunks = set(chunks_to_include) if chunks_to_include is not None else None
-    included_chunks = 0
-    chunk_lookup_time = 0.0
-    vector_aggregation_time = 0.0
-    cuda_cleanup_time = 0.0
-
+    print(f"Offset min max {offsets[0][0], offsets[-1][-1]}")
+    print(offsets[3139:3150])
+    print(f"Full text length {len(full_text)}")
+    print(f"Token count {input_ids.shape[-1]}")
+    print_token_window(model.tokenizer, input_ids, offsets, full_text, 3139, 16)
+    print_offset_anomalies(model.tokenizer, input_ids, offsets, full_text, limit=20)
     for chunk_idx, (chunk_start, chunk_end) in enumerate(spans):
         if allowed_chunks is not None and chunk_idx not in allowed_chunks:
             continue
 
-        step_start = time.perf_counter()
         chunk_token_indices = token_indices_overlapping_span(offsets, chunk_start, chunk_end)
+        
         previous_token_idx = last_token_before_span(offsets, chunk_start)
-        chunk_lookup_time += time.perf_counter() - step_start
-
+        if chunk_idx % 12 == 0:
+            print(chunk_idx)
+            print(chunk_token_indices)
+            print(previous_token_idx)
         if not chunk_token_indices:
             print(f"Warning: no token indices found for problem {problem_id}, chunk {chunk_idx}", flush=True)
-            continue
+            print_chunk_alignment_debug(
+                model.tokenizer,
+                input_ids,
+                offsets,
+                full_text,
+                chunk_idx,
+                chunk_start,
+                chunk_end,
+            )
+            break
         if previous_token_idx is None:
             print(f"Warning: no previous token for problem {problem_id}, chunk {chunk_idx}", flush=True)
             continue
@@ -266,38 +408,13 @@ def extract_problem_residuals(
         problem_results["mean_vector"][chunk_idx] = {}
         problem_results["last_token_vector"][chunk_idx] = {}
 
-        included_chunks += 1
-        synchronize_cuda(torch)
-        step_start = time.perf_counter()
-        for layer in range(model.cfg.n_layers):
-            resid = cache[utilities.get_act_name("resid_post", layer=layer)][0]
-            problem_results["mean_vector"][chunk_idx][layer] = resid[chunk_token_indices, :].mean(dim=0)
-            problem_results["last_token_vector"][chunk_idx][layer] = resid[previous_token_idx, :]
-        synchronize_cuda(torch)
-        vector_aggregation_time += time.perf_counter() - step_start
-        del resid
-        if torch.cuda.is_available():
-            synchronize_cuda(torch)
-            step_start = time.perf_counter()
-            torch.cuda.empty_cache()
-            synchronize_cuda(torch)
-            cuda_cleanup_time += time.perf_counter() - step_start
+        # for layer in range(model.cfg.n_layers):
+        #     resid = cache[utilities.get_act_name("resid_post", layer=layer)][0]
+        #     problem_results["mean_vector"][chunk_idx][layer] = resid[chunk_token_indices, :].mean(dim=0)
+        #     problem_results["last_token_vector"][chunk_idx][layer] = resid[previous_token_idx, :]
+        # del resid
 
-    log_problem_timing(problem_id, "chunk_token_lookup", chunk_lookup_time)
-    log_problem_timing(problem_id, "vector_aggregation", vector_aggregation_time)
-    print(
-        f"problem_{problem_id} timing: chunks_processed={included_chunks}/{len(spans)}",
-        flush=True,
-    )
-    del cache
-    if torch.cuda.is_available():
-        synchronize_cuda(torch)
-        step_start = time.perf_counter()
-        torch.cuda.empty_cache()
-        synchronize_cuda(torch)
-        cuda_cleanup_time += time.perf_counter() - step_start
-    if cuda_cleanup_time:
-        log_problem_timing(problem_id, "cuda_empty_cache", cuda_cleanup_time)
+    # del cache
 
     return problem_results
 
@@ -328,37 +445,11 @@ def load_existing_output(path: Path, overwrite: bool) -> Dict[str, Dict[str, Dic
     return {"mean_vector": {}, "last_token_vector": {}}
 
 
-def write_output(
-    path: Path,
-    output: Dict[str, Dict[str, Dict[str, Dict[int, Any]]]],
-    problem_id: Optional[str] = None,
-) -> None:
-    step_start = time.perf_counter()
+def write_output(path: Path, output: Dict[str, Dict[str, Dict[str, Dict[int, Any]]]]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    mkdir_elapsed = time.perf_counter() - step_start
-    step_start = time.perf_counter()
     payload = [{exp_id: problems} for exp_id, problems in output.items()]
-    payload_elapsed = time.perf_counter() - step_start
-    step_start = time.perf_counter()
-    jsonable_payload = to_jsonable(payload)
-    conversion_elapsed = time.perf_counter() - step_start
-    step_start = time.perf_counter()
     with open(path, "w", encoding="utf-8") as f:
-        json.dump(jsonable_payload, f, indent=2)
-    write_elapsed = time.perf_counter() - step_start
-    prefix = f"problem_{problem_id} timing: write_output" if problem_id else "write_output timing"
-    print(
-        f"{prefix}: "
-        f"mkdir={mkdir_elapsed:.2f}s "
-        f"build_payload={payload_elapsed:.2f}s "
-        f"to_jsonable={conversion_elapsed:.2f}s "
-        f"json_dump={write_elapsed:.2f}s",
-        flush=True,
-    )
-
-
-def build_problem_output_path(output_dir: Path, problem_id: str) -> Path:
-    return output_dir / f"problem_{problem_id}" / DEFAULT_RESIDUAL_FILE
+        json.dump(to_jsonable(payload), f, indent=2)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -375,13 +466,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--input_dir", type=Path, default=None, help="Full resolved input directory. Overrides -cid/-m/-t/-tp.")
     parser.add_argument("-is", "--input_exp_suffix", type=str, default=None)
     parser.add_argument("--chunks_to_include", type=Path, default=SCRIPT_DIR / "input_args" / "chunks_to_include.json")
-    parser.add_argument(
-        "--output",
-        type=Path,
-        default=None,
-        help="Directory for per-problem residual outputs. Defaults to the preset Inputs directory.",
-    )
-    parser.add_argument("--overwrite", action="store_true", help="Ignore existing per-problem residual output files.")
+    parser.add_argument("--output", type=Path, default=None)
+    parser.add_argument("--overwrite", action="store_true", help="Ignore an existing residual_stream_extracts.json.")
     parser.add_argument("--device", type=str, default=None, help="Device for local model loading, e.g. cpu or cuda.")
     parser.add_argument("--device_map", type=str, default=None, help="Device map for VM/GPU loading, e.g. auto.")
     parser.add_argument("--dtype", type=str, default="bfloat16", choices=["bf16", "bfloat16", "fp16", "float16", "fp32", "float32"])
@@ -393,33 +479,28 @@ def build_parser() -> argparse.ArgumentParser:
 def main() -> None:
     args = build_parser().parse_args()
 
-    from transformer_lens.model_bridge import TransformerBridge
+    from transformers import AutoTokenizer
 
     input_dir = args.input_dir or build_chunks_input_dir(args)
     input_dir = Path(input_dir)
     problem_ids = parse_problem_ids(args.specific_problems) or discover_problem_ids(input_dir)
     chunks_filtering_dict = load_chunks_to_include(args.chunks_to_include)
-    output_dir = args.output or PRESETS[args.preset]["output_dir"]
 
     hf_model = args.hf_model or PRESETS[args.preset]["hf_model"] #"deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B"#args.hf_model or PRESETS[args.preset]["hf_model"]
-    device = args.device if args.device is not None else PRESETS[args.preset]["device"]
-    device_map = args.device_map if args.device_map is not None else PRESETS[args.preset]["device_map"]
-
-    model_kwargs = {
-        "dtype": parse_dtype(args.dtype),
+    tokenizer_kwargs = {
         "trust_remote_code": args.trust_remote_code,
     }
-    if device_map:
-        model_kwargs["device_map"] = device_map
-    elif device:
-        model_kwargs["device"] = device
 
-    # hf_token = args.hf_token or os.getenv("HF_KEY") or os.getenv("HF_TOKEN")
-    # if hf_token:
-    #     model_kwargs["token"] = hf_token
+    hf_token = args.hf_token or os.getenv("HF_KEY") or os.getenv("HF_TOKEN")
+    if hf_token:
+        tokenizer_kwargs["token"] = hf_token
 
-    print(f"Loading model {hf_model}", flush=True)
-    model = TransformerBridge.boot_transformers(hf_model, **model_kwargs)
+    print(f"Loading tokenizer {hf_model}", flush=True)
+    tokenizer = AutoTokenizer.from_pretrained(hf_model, **tokenizer_kwargs)
+    model = SimpleNamespace(tokenizer=tokenizer, cfg=SimpleNamespace(device="cpu"))
+    print(f"Tokenizer class: {tokenizer.__class__.__name__}", flush=True)
+    print(f"Fast tokenizer: {getattr(tokenizer, 'is_fast', None)}", flush=True)
+    print(f"Model max length: {getattr(tokenizer, 'model_max_length', None)}", flush=True)
 
     start_time = time.time()
     for problem_index, problem_id in enumerate(problem_ids, start=1):
@@ -428,35 +509,16 @@ def main() -> None:
             print(f"Skipping missing problem directory: {problem_dir}", flush=True)
             continue
 
-        output_path = build_problem_output_path(Path(output_dir), problem_id)
-        step_start = time.perf_counter()
-        output = load_existing_output(output_path, args.overwrite)
-        log_problem_timing(problem_id, "load_existing_output", time.perf_counter() - step_start)
-        if (
-            not args.overwrite
-            and problem_id in output.get("mean_vector", {})
-            and problem_id in output.get("last_token_vector", {})
-        ):
-            print(f"Skipping already extracted problem_{problem_id}", flush=True)
-            continue
-
-        print(f"[{problem_index}/{len(problem_ids)}] Extracting problem_{problem_id}", flush=True)
+        print(f"[{problem_index}/{len(problem_ids)}] Debugging tokenizer offsets for problem_{problem_id}", flush=True)
         problem_start = time.time()
-        problem_result = extract_problem_residuals(
+        extract_problem_residuals(
             model,
             problem_dir,
             problem_id,
             chunks_to_include=chunks_filtering_dict.get(problem_id) if chunks_filtering_dict else None,
         )
-        step_start = time.perf_counter()
-        merge_problem_result(output, problem_id, problem_result)
-        log_problem_timing(problem_id, "merge_problem_result", time.perf_counter() - step_start)
-        step_start = time.perf_counter()
-        write_output(output_path, output, problem_id=problem_id)
-        log_problem_timing(problem_id, "write_output_total", time.perf_counter() - step_start)
-        print(f"Saved problem_{problem_id} to {output_path} in {time.time() - problem_start:.2f}s", flush=True)
+        print(f"Finished problem_{problem_id} in {time.time() - problem_start:.2f}s", flush=True)
 
-    print(f"Saved residual stream extracts under {Path(output_dir)}", flush=True)
     print(f"Total time: {time.time() - start_time:.2f}s", flush=True)
 
 

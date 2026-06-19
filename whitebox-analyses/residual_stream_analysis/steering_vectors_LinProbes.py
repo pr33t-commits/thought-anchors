@@ -3,7 +3,7 @@ import csv
 import json
 from collections import Counter, defaultdict
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 import numpy as np
 
@@ -13,13 +13,13 @@ PROJECT_ROOT = Path(__file__).resolve().parents[2]
 
 PRESETS = {
     "local": {
-        "residual_input_dir": SCRIPT_DIR / "Input",
+        "residual_input_dir": SCRIPT_DIR / "Inputs",
         "chunk_input_dir": PROJECT_ROOT / "math_rollouts",
         "output_dir": SCRIPT_DIR / "Results" / "linear_probes",
         "model": "deepseek-r1-distill-Qwen-1.5b",
     },
     "vm": {
-        "residual_input_dir": Path("/home/lodaya_dimpal/storage/residual_stream_analysis/Input"),
+        "residual_input_dir": Path("/home/lodaya_dimpal/storage/residual_stream_analysis/Inputs"),
         "chunk_input_dir": Path("/home/lodaya_dimpal/storage/math_rollouts"),
         "output_dir": Path("/home/lodaya_dimpal/storage/Results/linear_probes"),
         "model": "deepseek-r1-distill-llama-8b",
@@ -37,11 +37,36 @@ def parse_problem_ids(problem_ids: Optional[str]) -> Optional[List[str]]:
         return None
     return [problem.strip().removeprefix("problem_") for problem in problem_ids.split(",") if problem.strip()]
 
-def build_residual_path(args: argparse.Namespace) -> Path:
+def build_residual_paths(
+    args: argparse.Namespace,
+    problem_ids: Optional[List[str]] = None,
+) -> List[Path]:
     if args.residual_path:
-        return args.residual_path
+        path = Path(args.residual_path)
+        if path.is_dir():
+            return discover_residual_paths(path, args.residual_file, problem_ids)
+        return [path]
     residual_input_dir = args.residual_input_dir or PRESETS[args.preset]["residual_input_dir"]
-    return Path(residual_input_dir) / args.residual_file
+    return discover_residual_paths(Path(residual_input_dir), args.residual_file, problem_ids)
+
+
+def discover_residual_paths(
+    residual_input_dir: Path,
+    residual_file: str,
+    problem_ids: Optional[List[str]] = None,
+) -> List[Path]:
+    if problem_ids is not None:
+        return [
+            residual_input_dir / f"problem_{problem_id}" / residual_file
+            for problem_id in problem_ids
+        ]
+
+    problem_paths = sorted(residual_input_dir.glob(f"problem_*/{residual_file}"))
+    if problem_paths:
+        return problem_paths
+
+    legacy_path = residual_input_dir / residual_file
+    return [legacy_path]
 
 
 def build_labels_root(args: argparse.Namespace) -> Path:
@@ -76,6 +101,14 @@ def build_output_dir(args: argparse.Namespace) -> Path:
 def load_json(path: Path) -> Any:
     with open(path, "r", encoding="utf-8") as f:
         return json.load(f)
+
+
+def load_residual_inputs(paths: Sequence[Path]) -> List[Any]:
+    missing_paths = [path for path in paths if not path.is_file()]
+    if missing_paths:
+        missing = "\n".join(str(path) for path in missing_paths)
+        raise FileNotFoundError(f"Missing residual stream JSON file(s):\n{missing}")
+    return [load_json(path) for path in paths]
 
 def normalize_problem_id(problem_id: Any) -> str:
     if "problem_" in str(problem_id):
@@ -156,54 +189,55 @@ def load_problem_labels(labels_root: Path, problem_id: str) -> Dict[int, List[st
     return labels
 
 def build_examples(
-    residual_path: Path,
+    residual_paths: Sequence[Path],
     labels_root: Path,
     tag_mode: str,
     vector_pool: str,
     problem_ids: Optional[List[str]] = None,
 ) -> Tuple[Dict[Tuple[str, str], List[Example]], Dict[str, Any]]:
-    residual_data = load_json(residual_path)
+    residual_inputs = load_residual_inputs(residual_paths)
     labels_cache: Dict[str, Dict[int, List[str]]] = {}
     examples_by_probe: Dict[Tuple[str, str], List[Example]] = defaultdict(list)
     skipped = Counter()
     allowed_problems = set(problem_ids) if problem_ids is not None else None
 
     expected_dim: Dict[Tuple[str, str], int] = {}
-    for exp_id, problem_id, chunk_id, layer, vector in iter_residual_records(residual_data):
-        if allowed_problems is not None and problem_id not in allowed_problems:
-            skipped["filtered_problem"] += 1
-            continue
-
-        if problem_id not in labels_cache:
-            try:
-                labels_cache[problem_id] = load_problem_labels(labels_root, problem_id)
-            except FileNotFoundError:
-                skipped["missing_problem_labels"] += 1
+    for residual_data in residual_inputs:
+        for exp_id, problem_id, chunk_id, layer, vector in iter_residual_records(residual_data):
+            if allowed_problems is not None and problem_id not in allowed_problems:
+                skipped["filtered_problem"] += 1
                 continue
 
-        tags = labels_cache[problem_id].get(chunk_id, [])
-        if not tags:
-            skipped["missing_chunk_labels"] += 1
-            continue
+            if problem_id not in labels_cache:
+                try:
+                    labels_cache[problem_id] = load_problem_labels(labels_root, problem_id)
+                except FileNotFoundError:
+                    skipped["missing_problem_labels"] += 1
+                    continue
 
-        try:
-            arr = vector_to_1d(vector, vector_pool)
-        except ValueError:
-            skipped["invalid_vector"] += 1
-            continue
+            tags = labels_cache[problem_id].get(chunk_id, [])
+            if not tags:
+                skipped["missing_chunk_labels"] += 1
+                continue
 
-        probe_key = (exp_id, layer)
-        if probe_key in expected_dim and arr.shape[0] != expected_dim[probe_key]:
-            skipped["inconsistent_vector_dim"] += 1
-            continue
-        expected_dim.setdefault(probe_key, arr.shape[0])
+            try:
+                arr = vector_to_1d(vector, vector_pool)
+            except ValueError:
+                skipped["invalid_vector"] += 1
+                continue
 
-        selected_tags = tags if tag_mode == "explode" else tags[:1]
-        for tag in selected_tags:
-            examples_by_probe[probe_key].append((exp_id, problem_id, chunk_id, tag, arr))
+            probe_key = (exp_id, layer)
+            if probe_key in expected_dim and arr.shape[0] != expected_dim[probe_key]:
+                skipped["inconsistent_vector_dim"] += 1
+                continue
+            expected_dim.setdefault(probe_key, arr.shape[0])
+
+            selected_tags = tags if tag_mode == "explode" else tags[:1]
+            for tag in selected_tags:
+                examples_by_probe[probe_key].append((exp_id, problem_id, chunk_id, tag, arr))
 
     metadata = {
-        "residual_path": str(residual_path),
+        "residual_paths": [str(path) for path in residual_paths],
         "labels_root": str(labels_root),
         "tag_mode": tag_mode,
         "vector_pool": vector_pool,
@@ -385,13 +419,13 @@ def build_parser() -> argparse.ArgumentParser:
         "--residual-path",
         type=Path,
         default=None,
-        help="Full path to residual stream JSON. Overrides --residual-input-dir/--residual-file.",
+        help="Full path to a residual stream JSON or directory of per-problem JSON files. Overrides --residual-input-dir.",
     )
     parser.add_argument(
         "--residual-input-dir",
         type=Path,
         default=None,
-        help="Directory containing the residual stream JSON.",
+        help="Directory containing problem_*/residual stream JSON files.",
     )
     parser.add_argument(
         "--residual-file",
@@ -446,13 +480,13 @@ def main() -> None:
     if args.splits < 2:
         raise ValueError("--splits must be at least 2.")
 
-    residual_path = build_residual_path(args)
+    specific_problems = parse_problem_ids(args.specific_problems)
+    residual_paths = build_residual_paths(args, specific_problems)
     labels_root = build_labels_root(args)
     output_dir = build_output_dir(args)
-    specific_problems = parse_problem_ids(args.specific_problems)
 
     examples_by_probe, metadata = build_examples(
-        residual_path=residual_path,
+        residual_paths=residual_paths,
         labels_root=labels_root,
         tag_mode=args.tag_mode,
         vector_pool=args.vector_pool,
