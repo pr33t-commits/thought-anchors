@@ -28,9 +28,13 @@ PRESETS = {
 }
 
 DEFAULT_RESIDUAL_FILE = "residual_stream_extracts.json"
+DEFAULT_VECTOR_POOLS = ["mean_vector", "last_tokenvector"]
+SAMPLE_WEIGHT_FIELDS = (
+    "counterfactual_importance_kl",
+    "conterfactual_importance_kl",
+)
 
-
-Example = Tuple[str, str, int, str, np.ndarray]
+Example = Tuple[str, str, int, str, np.ndarray, float]
 
 
 def log_problem_timing(problem_id: str, step: str, elapsed: float) -> None:
@@ -45,6 +49,16 @@ def parse_problem_ids(problem_ids: Optional[str]) -> Optional[List[str]]:
     if not problem_ids:
         return None
     return [problem.strip().removeprefix("problem_") for problem in problem_ids.split(",") if problem.strip()]
+
+
+def parse_vector_pools(value: Optional[str]) -> List[str]:
+    if not value:
+        return list(DEFAULT_VECTOR_POOLS)
+    pools = [item.strip() for item in value.split(",") if item.strip()]
+    if not pools:
+        return list(DEFAULT_VECTOR_POOLS)
+    return pools
+
 
 def build_residual_paths(
     args: argparse.Namespace,
@@ -138,10 +152,12 @@ def load_residual_inputs(paths: Sequence[Path]) -> List[Tuple[Path, Any]]:
         residual_inputs.append((path, residual_data))
     return residual_inputs
 
+
 def normalize_problem_id(problem_id: Any) -> str:
     if "problem_" in str(problem_id):
         return str(problem_id).removeprefix("problem_")
     return str(problem_id)
+
 
 def normalize_chunk_id(chunk_id: Any) -> int:
     if isinstance(chunk_id, int):
@@ -192,33 +208,51 @@ def vector_to_1d(vector: Any, pool: str) -> np.ndarray:
     if arr.ndim == 0:
         raise ValueError("Residual stream vector must have at least one dimension.")
     if arr.ndim > 1:
-        if pool == "mean":
+        if pool == "mean_vector":
             arr = arr.mean(axis=tuple(range(arr.ndim - 1)))
-        elif pool == "flatten":
-            arr = arr.reshape(-1)
+        elif pool == "last_tokenvector":
+            arr = arr.reshape(-1, arr.shape[-1])[-1]
         else:
             raise ValueError(f"Unsupported vector pooling strategy: {pool}")
     if not np.isfinite(arr).all():
         raise ValueError("Residual stream vector contains NaN or infinite values.")
     return arr
 
-def load_problem_labels(labels_root: Path, problem_id: str) -> Dict[int, List[str]]:
+
+def _normalize_sample_weight(chunk: Dict[str, Any]) -> float:
+    for field in SAMPLE_WEIGHT_FIELDS:
+        if field in chunk:
+            value = chunk.get(field, 0.0)
+            try:
+                weight = float(value)
+            except (TypeError, ValueError):
+                return 0.0
+            return max(weight, 0.0)
+    return 0.0
+
+
+def load_problem_labels(labels_root: Path, problem_id: str) -> Dict[int, Dict[str, Any]]:
     labels_path = labels_root / f"problem_{problem_id}" / "chunks_labeled.json"
     if not labels_path.is_file():
         print(f"labels file not found for problem_{problem_id} at expected path: {labels_path}", flush=True)
         raise FileNotFoundError(f"Missing labels file: {labels_path}")
 
-    print(load_json(labels_path)[0])
-    
-    labels = {}
-    for chunk in load_json(labels_path):
-        
+    chunks = load_json(labels_path)
+    if chunks:
+        print(chunks[0], flush=True)
+
+    labels: Dict[int, Dict[str, Any]] = {}
+    for chunk in chunks:
         chunk_id = normalize_chunk_id(chunk["chunk_idx"])
         tags = chunk.get("function_tags", [])
         if isinstance(tags, str):
             tags = [tags]
-        labels[chunk_id] = [str(tag) for tag in tags if str(tag)]
+        labels[chunk_id] = {
+            "tags": [str(tag) for tag in tags if str(tag)],
+            "sample_weight": _normalize_sample_weight(chunk),
+        }
     return labels
+
 
 def build_examples(
     residual_paths: Sequence[Path],
@@ -228,7 +262,7 @@ def build_examples(
     problem_ids: Optional[List[str]] = None,
 ) -> Tuple[Dict[Tuple[str, str], List[Example]], Dict[str, Any]]:
     residual_inputs = load_residual_inputs(residual_paths)
-    labels_cache: Dict[str, Dict[int, List[str]]] = {}
+    labels_cache: Dict[str, Dict[int, Dict[str, Any]]] = {}
     examples_by_probe: Dict[Tuple[str, str], List[Example]] = defaultdict(list)
     skipped = Counter()
     allowed_problems = set(problem_ids) if problem_ids is not None else None
@@ -236,7 +270,7 @@ def build_examples(
     problem_counts: Dict[str, Counter] = defaultdict(Counter)
 
     expected_dim: Dict[Tuple[str, str], int] = {}
-    
+
     for residual_path, residual_data in residual_inputs:
         residual_file_problem_id = problem_id_from_residual_path(residual_path)
         step_start = time.perf_counter()
@@ -258,7 +292,6 @@ def build_examples(
                 try:
                     labels_cache[problem_id] = load_problem_labels(labels_root, problem_id)
                 except FileNotFoundError:
-                    # print(f"Warning: Missing labels for problem_{problem_id} at {labels_root}", flush=True)
                     skipped["missing_problem_labels"] += 1
                     problem_counts[problem_id]["missing_problem_labels"] += 1
                     continue
@@ -267,8 +300,11 @@ def build_examples(
                 log_problem_timing(problem_id, "load_problem_labels", label_elapsed)
 
             lookup_start = time.perf_counter()
-            tags = labels_cache[problem_id].get(chunk_id, [])
+            label_info = labels_cache[problem_id].get(chunk_id, {})
             problem_timers[problem_id]["label_lookup"] += time.perf_counter() - lookup_start
+            tags = label_info.get("tags", [])
+            sample_weight = float(label_info.get("sample_weight", 0.0))
+
             if not tags:
                 print(f"Warning: No labels found for problem_{problem_id} chunk_{chunk_id}", flush=True)
                 skipped["missing_chunk_labels"] += 1
@@ -297,17 +333,14 @@ def build_examples(
             append_start = time.perf_counter()
             selected_tags = tags if tag_mode == "explode" else tags[:1]
             for tag in selected_tags:
-                examples_by_probe[probe_key].append((exp_id, problem_id, chunk_id, tag, arr))
+                examples_by_probe[probe_key].append((exp_id, problem_id, chunk_id, tag, arr, sample_weight))
                 problem_counts[problem_id]["examples"] += 1
             problem_timers[problem_id]["append_examples"] += time.perf_counter() - append_start
         file_elapsed = time.perf_counter() - step_start
-        print(residual_file_problem_id)
         if residual_file_problem_id is not None:
             log_problem_timing(residual_file_problem_id, "process_residual_records", file_elapsed)
         else:
             print(f"residual input timing: process_residual_records {residual_path}={file_elapsed:.2f}s", flush=True)
-        print(examples_by_probe.keys())
-        print(examples_by_probe[list(examples_by_probe.keys())[-1]][:3])
     for problem_id in sorted(problem_counts, key=lambda item: int(item) if item.isdigit() else item):
         for step, elapsed in problem_timers[problem_id].items():
             if step == "load_problem_labels":
@@ -334,34 +367,79 @@ def build_examples(
         "skipped": dict(skipped),
         "num_probes": len(examples_by_probe),
         "problems_loaded": sorted(labels_cache.keys(), key=lambda item: int(item) if item.isdigit() else item),
+        "sample_weight_fields": list(SAMPLE_WEIGHT_FIELDS),
     }
     return examples_by_probe, metadata
 
-def make_probe():
+
+def make_probe(probe_type: str):
     from sklearn.linear_model import LogisticRegression
+    from sklearn.multiclass import OneVsRestClassifier
     from sklearn.pipeline import Pipeline
     from sklearn.preprocessing import StandardScaler
+
+    base_lr = LogisticRegression(
+        C=1.0,
+        class_weight="balanced",
+        max_iter=5000,
+        penalty="l2",
+        solver="lbfgs",
+    )
+
+    if probe_type == "multinomial":
+        classifier = LogisticRegression(
+            C=1.0,
+            class_weight="balanced",
+            max_iter=5000,
+            # multi_class="multinomial",
+            penalty="l2",
+            solver="lbfgs",
+        )
+    elif probe_type == "one_vs_rest":
+        classifier = OneVsRestClassifier(base_lr)
+    else:
+        raise ValueError(f"Unsupported probe_type: {probe_type}")
 
     return Pipeline(
         steps=[
             ("standardize", StandardScaler()),
-            (
-                "probe",
-                LogisticRegression(
-                    C=1.0,
-                    class_weight="balanced",
-                    max_iter=5000,
-                    penalty="l2",
-                    solver="lbfgs",
-                ),
-            ),
+            ("probe", classifier),
         ]
     )
+
+
+def extract_class_coefficients(model: Any, probe_type: str) -> Dict[str, Dict[str, Any]]:
+    probe = model.named_steps["probe"]
+
+    if probe_type == "multinomial":
+        classes = [str(label) for label in probe.classes_]
+        coef = np.asarray(probe.coef_, dtype=float)
+        intercept = np.asarray(probe.intercept_, dtype=float)
+        return {
+            class_label: {
+                "coef": coef[idx].tolist(),
+                "intercept": float(intercept[idx]) if intercept.ndim > 0 else float(intercept),
+            }
+            for idx, class_label in enumerate(classes)
+        }
+
+    classes = [str(label) for label in probe.classes_]
+    coefficients: Dict[str, Dict[str, Any]] = {}
+    for class_label, estimator in zip(classes, probe.estimators_):
+        coef = np.asarray(estimator.coef_, dtype=float).reshape(-1)
+        intercept = np.asarray(estimator.intercept_, dtype=float).reshape(-1)
+        coefficients[class_label] = {
+            "coef": coef.tolist(),
+            "intercept": float(intercept[0]) if intercept.size else 0.0,
+        }
+    return coefficients
+
 
 def evaluate_probe(
     probe_key: Tuple[str, str],
     examples: List[Example],
     requested_splits: int,
+    probe_type: str,
 ) -> Dict[str, Any]:
     eval_start = time.perf_counter()
     import_start = time.perf_counter()
@@ -370,6 +448,7 @@ def evaluate_probe(
         classification_report,
         confusion_matrix,
         f1_score,
+        recall_score,
     )
     from sklearn.model_selection import GroupKFold
     import_elapsed = time.perf_counter() - import_start
@@ -380,17 +459,19 @@ def evaluate_probe(
     X = np.vstack([example[4] for example in examples])
     y = np.asarray([example[3] for example in examples])
     groups = np.asarray([example[1] for example in examples])
+    sample_weights = np.asarray([example[5] for example in examples], dtype=float)
     log_probe_timing(exp_id, layer, "build_arrays", time.perf_counter() - step_start)
 
-    print(X.shape, y.shape, groups.shape)
+    print(X.shape, y.shape, groups.shape, sample_weights.shape)
     print(X.mean(), y[:5])
-    
+
     step_start = time.perf_counter()
     classes = sorted(set(y))
     unique_groups = sorted(set(groups))
     result: Dict[str, Any] = {
         "exp_id": exp_id,
         "layer": layer,
+        "probe_type": probe_type,
         "num_examples": int(len(examples)),
         "num_features": int(X.shape[1]),
         "num_classes": int(len(classes)),
@@ -417,6 +498,7 @@ def evaluate_probe(
     splitter = GroupKFold(n_splits=n_splits)
     y_true_all: List[str] = []
     y_pred_all: List[str] = []
+    weights_all: List[float] = []
     fold_results = []
     log_probe_timing(exp_id, layer, "setup_group_kfold", time.perf_counter() - step_start)
 
@@ -439,7 +521,7 @@ def evaluate_probe(
             continue
 
         step_start = time.perf_counter()
-        model = make_probe()
+        model = make_probe(probe_type)
         log_probe_timing(exp_id, layer, f"fold_{fold_idx}_make_probe", time.perf_counter() - step_start)
         step_start = time.perf_counter()
         model.fit(X[train_idx], y[train_idx])
@@ -448,9 +530,21 @@ def evaluate_probe(
         y_pred = model.predict(X[test_idx])
         log_probe_timing(exp_id, layer, f"fold_{fold_idx}_predict", time.perf_counter() - step_start)
 
+        fold_sample_weights = sample_weights[test_idx]
+        fold_report = classification_report(
+            y[test_idx],
+            y_pred,
+            labels=classes,
+            output_dict=True,
+            zero_division=0,
+            sample_weight=fold_sample_weights,
+        )
+        fold_coefficients = extract_class_coefficients(model, probe_type)
+
         step_start = time.perf_counter()
         y_true_all.extend(y[test_idx].tolist())
         y_pred_all.extend(y_pred.tolist())
+        weights_all.extend(fold_sample_weights.tolist())
         fold_results.append(
             {
                 "fold": fold_idx,
@@ -461,11 +555,13 @@ def evaluate_probe(
                 "test_groups": sorted(set(groups[test_idx])),
                 "train_classes": sorted(train_classes),
                 "test_classes": sorted(test_classes),
-                "accuracy": float(accuracy_score(y[test_idx], y_pred)),
-                "f1_macro": float(f1_score(y[test_idx], y_pred, average="macro", zero_division=0)),
-                "f1_weighted": float(
-                    f1_score(y[test_idx], y_pred, average="weighted", zero_division=0)
-                ),
+                "accuracy": float(accuracy_score(y[test_idx], y_pred, sample_weight=fold_sample_weights)),
+                "f1_macro": float(f1_score(y[test_idx], y_pred, average="macro", zero_division=0, sample_weight=fold_sample_weights)),
+                "f1_weighted": float(f1_score(y[test_idx], y_pred, average="weighted", zero_division=0, sample_weight=fold_sample_weights)),
+                "recall_macro": float(recall_score(y[test_idx], y_pred, average="macro", zero_division=0, sample_weight=fold_sample_weights)),
+                "recall_weighted": float(recall_score(y[test_idx], y_pred, average="weighted", zero_division=0, sample_weight=fold_sample_weights)),
+                "classification_report": fold_report,
+                "class_coefficients": fold_coefficients,
             }
         )
         log_probe_timing(exp_id, layer, f"fold_{fold_idx}_metrics", time.perf_counter() - step_start)
@@ -480,25 +576,32 @@ def evaluate_probe(
 
     step_start = time.perf_counter()
     labels = sorted(set(y_true_all).union(y_pred_all))
+    aggregate_report = classification_report(
+        y_true_all,
+        y_pred_all,
+        labels=labels,
+        output_dict=True,
+        zero_division=0,
+        sample_weight=np.asarray(weights_all, dtype=float),
+    )
     result.update(
         {
             "status": "ok",
             "n_splits": int(n_splits),
             "folds": fold_results,
-            "accuracy": float(accuracy_score(y_true_all, y_pred_all)),
-            "f1_macro": float(f1_score(y_true_all, y_pred_all, average="macro", zero_division=0)),
-            "f1_weighted": float(
-                f1_score(y_true_all, y_pred_all, average="weighted", zero_division=0)
-            ),
+            "accuracy": float(accuracy_score(y_true_all, y_pred_all, sample_weight=np.asarray(weights_all, dtype=float))),
+            "f1_macro": float(f1_score(y_true_all, y_pred_all, average="macro", zero_division=0, sample_weight=np.asarray(weights_all, dtype=float))),
+            "f1_weighted": float(f1_score(y_true_all, y_pred_all, average="weighted", zero_division=0, sample_weight=np.asarray(weights_all, dtype=float))),
+            "recall_macro": float(recall_score(y_true_all, y_pred_all, average="macro", zero_division=0, sample_weight=np.asarray(weights_all, dtype=float))),
+            "recall_weighted": float(recall_score(y_true_all, y_pred_all, average="weighted", zero_division=0, sample_weight=np.asarray(weights_all, dtype=float))),
             "confusion_matrix_labels": labels,
-            "confusion_matrix": confusion_matrix(y_true_all, y_pred_all, labels=labels).tolist(),
-            "classification_report": classification_report(
+            "confusion_matrix": confusion_matrix(
                 y_true_all,
                 y_pred_all,
                 labels=labels,
-                output_dict=True,
-                zero_division=0,
-            ),
+                sample_weight=np.asarray(weights_all, dtype=float),
+            ).tolist(),
+            "classification_report": aggregate_report,
         }
     )
     log_probe_timing(exp_id, layer, "aggregate_final_metrics", time.perf_counter() - step_start)
@@ -506,9 +609,85 @@ def evaluate_probe(
     return result
 
 
+def _safe_float(value: Any) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def build_selection_summary(results: List[Dict[str, Any]]) -> Dict[str, Any]:
+    ok_results = [result for result in results if result.get("status") == "ok"]
+    summary: Dict[str, Any] = {
+        "overall": {},
+        "per_class": {},
+    }
+
+    if not ok_results:
+        return summary
+
+    probe_types = sorted({result["probe_type"] for result in ok_results})
+    class_names = sorted({cls for result in ok_results for cls in result.get("classes", [])})
+
+    def collect_metric(metric_name: str) -> Dict[str, float]:
+        values_by_type = {}
+        for probe_type in probe_types:
+            probe_results = [result for result in ok_results if result["probe_type"] == probe_type]
+            values = [_safe_float(result.get(metric_name, 0.0)) for result in probe_results]
+            values_by_type[probe_type] = float(np.mean(values)) if values else 0.0
+        return values_by_type
+
+    overall_f1 = collect_metric("f1_macro")
+    overall_recall = collect_metric("recall_macro")
+
+    summary["overall"]["best_f1"] = {
+        "metric": "f1_macro",
+        "scores_by_probe_type": overall_f1,
+        "selected_probe_type": max(overall_f1, key=overall_f1.get) if overall_f1 else None,
+    }
+    summary["overall"]["best_recall"] = {
+        "metric": "recall_macro",
+        "scores_by_probe_type": overall_recall,
+        "selected_probe_type": max(overall_recall, key=overall_recall.get) if overall_recall else None,
+    }
+
+    for class_name in class_names:
+        class_f1_scores: Dict[str, float] = {}
+        class_recall_scores: Dict[str, float] = {}
+        for probe_type in probe_types:
+            probe_results = [result for result in ok_results if result["probe_type"] == probe_type]
+            f1_values = []
+            recall_values = []
+            for result in probe_results:
+                report = result.get("classification_report", {})
+                class_report = report.get(class_name)
+                if isinstance(class_report, dict):
+                    f1_values.append(_safe_float(class_report.get("f1-score", 0.0)))
+                    recall_values.append(_safe_float(class_report.get("recall", 0.0)))
+            class_f1_scores[probe_type] = float(np.mean(f1_values)) if f1_values else 0.0
+            class_recall_scores[probe_type] = float(np.mean(recall_values)) if recall_values else 0.0
+
+        summary["per_class"][class_name] = {
+            "best_f1": {
+                "metric": "f1-score",
+                "scores_by_probe_type": class_f1_scores,
+                "selected_probe_type": max(class_f1_scores, key=class_f1_scores.get) if class_f1_scores else None,
+            },
+            "best_recall": {
+                "metric": "recall",
+                "scores_by_probe_type": class_recall_scores,
+                "selected_probe_type": max(class_recall_scores, key=class_recall_scores.get) if class_recall_scores else None,
+            },
+        }
+
+    return summary
+
+
 def write_summary_csv(results: List[Dict[str, Any]], output_path: Path) -> None:
     step_start = time.perf_counter()
     fieldnames = [
+        "vector_pool",
+        "probe_type",
         "exp_id",
         "layer",
         "status",
@@ -520,6 +699,8 @@ def write_summary_csv(results: List[Dict[str, Any]], output_path: Path) -> None:
         "accuracy",
         "f1_macro",
         "f1_weighted",
+        "recall_macro",
+        "recall_weighted",
         "reason",
     ]
     fieldnames_elapsed = time.perf_counter() - step_start
@@ -541,7 +722,7 @@ def write_summary_csv(results: List[Dict[str, Any]], output_path: Path) -> None:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
-            "Train multinomial logistic-regression linear probes over residual stream "
+            "Train multinomial and one-vs-rest linear probes over residual stream "
             "vectors to classify chunk function_tags."
         )
     )
@@ -598,12 +779,101 @@ def build_parser() -> argparse.ArgumentParser:
         help="Use first function_tag per chunk, or duplicate examples across all tags.",
     )
     parser.add_argument(
+        "--vector-pools",
+        type=str,
+        default="mean_vector,last_tokenvector",
+        help="Comma-separated list of vector pooling strategies to run.",
+    )
+    parser.add_argument(
         "--vector-pool",
-        choices=["mean", "flatten"],
-        default="mean",
-        help="How to convert non-1D residual arrays into one feature vector.",
+        type=str,
+        default=None,
+        help="Legacy single-pool override. If set, only this pool is used.",
     )
     return parser
+
+
+def _run_for_vector_pool(
+    *,
+    args: argparse.Namespace,
+    vector_pool: str,
+    residual_paths: Sequence[Path],
+    labels_root: Path,
+    output_dir: Path,
+    specific_problems: Optional[List[str]],
+) -> Dict[str, Any]:
+    step_start = time.perf_counter()
+    examples_by_probe, metadata = build_examples(
+        residual_paths=residual_paths,
+        labels_root=labels_root,
+        tag_mode=args.tag_mode,
+        vector_pool=vector_pool,
+        problem_ids=specific_problems,
+    )
+    print(f"setup timing: build_examples_total[{vector_pool}]={time.perf_counter() - step_start:.2f}s", flush=True)
+
+    all_results: List[Dict[str, Any]] = []
+    step_start = time.perf_counter()
+    for probe_key in sorted(
+        examples_by_probe,
+        key=lambda item: (item[0], int(item[1]) if item[1].isdigit() else item[1]),
+    ):
+        for probe_type in ("multinomial", "one_vs_rest"):
+            result = evaluate_probe(probe_key, examples_by_probe[probe_key], args.splits, probe_type)
+            result["vector_pool"] = vector_pool
+            all_results.append(result)
+    print(f"probe timing: evaluate_all_probes_total[{vector_pool}]={time.perf_counter() - step_start:.2f}s", flush=True)
+
+    selection_summary = build_selection_summary(all_results)
+
+    step_start = time.perf_counter()
+    vector_output_dir = output_dir / vector_pool
+    vector_output_dir.mkdir(parents=True, exist_ok=True)
+    detailed_path = vector_output_dir / "linear_probe_results_test.json"
+    summary_path = vector_output_dir / "linear_probe_summary_test.csv"
+    selection_path = vector_output_dir / "linear_probe_selection_summary_test.json"
+    print(f"output timing: mkdir_and_paths[{vector_pool}]={time.perf_counter() - step_start:.2f}s", flush=True)
+
+    step_start = time.perf_counter()
+    with open(detailed_path, "w", encoding="utf-8") as f:
+        json.dump(
+            {
+                "metadata": {
+                    **metadata,
+                    "vector_pool": vector_pool,
+                    "probe_types": ["multinomial", "one_vs_rest"],
+                },
+                "selection_summary": selection_summary,
+                "results": all_results,
+            },
+            f,
+            indent=2,
+        )
+    print(f"output timing: detailed_json_write[{vector_pool}]={time.perf_counter() - step_start:.2f}s", flush=True)
+
+    step_start = time.perf_counter()
+    with open(selection_path, "w", encoding="utf-8") as f:
+        json.dump(selection_summary, f, indent=2)
+    print(f"output timing: selection_json_write[{vector_pool}]={time.perf_counter() - step_start:.2f}s", flush=True)
+
+    write_summary_csv(all_results, summary_path)
+
+    ok_count = sum(result["status"] == "ok" for result in all_results)
+    skipped_count = len(all_results) - ok_count
+    print(f"Evaluated {ok_count} probes for {vector_pool}; skipped {skipped_count}.")
+    print(f"Saved detailed results to {detailed_path}")
+    print(f"Saved summary CSV to {summary_path}")
+    print(f"Saved selection summary to {selection_path}")
+
+    return {
+        "vector_pool": vector_pool,
+        "metadata": metadata,
+        "selection_summary": selection_summary,
+        "results": all_results,
+        "detailed_path": str(detailed_path),
+        "summary_path": str(summary_path),
+        "selection_path": str(selection_path),
+    }
 
 
 def main() -> None:
@@ -619,45 +889,23 @@ def main() -> None:
     output_dir = build_output_dir(args)
     print(f"setup timing: resolve_paths={time.perf_counter() - step_start:.2f}s", flush=True)
 
-    step_start = time.perf_counter()
-    examples_by_probe, metadata = build_examples(
-        residual_paths=residual_paths,
-        labels_root=labels_root,
-        tag_mode=args.tag_mode,
-        vector_pool=args.vector_pool,
-        problem_ids=specific_problems,
-    )
-    print(f"setup timing: build_examples_total={time.perf_counter() - step_start:.2f}s", flush=True)
+    vector_pools = [args.vector_pool] if args.vector_pool else parse_vector_pools(args.vector_pools)
 
-    results = []
-    step_start = time.perf_counter()
-    for probe_key in sorted(
-        examples_by_probe,
-        key=lambda item: (item[0], int(item[1]) if item[1].isdigit() else item[1]),
-    ):
-        results.append(evaluate_probe(probe_key, examples_by_probe[probe_key], args.splits))
-    print(f"probe timing: evaluate_all_probes_total={time.perf_counter() - step_start:.2f}s", flush=True)
+    run_summaries = []
+    for vector_pool in vector_pools:
+        run_summaries.append(
+            _run_for_vector_pool(
+                args=args,
+                vector_pool=vector_pool,
+                residual_paths=residual_paths,
+                labels_root=labels_root,
+                output_dir=output_dir,
+                specific_problems=specific_problems,
+            )
+        )
 
-    step_start = time.perf_counter()
-    output_dir.mkdir(parents=True, exist_ok=True)
-    detailed_path = output_dir / "linear_probe_results_test.json"
-    summary_path = output_dir / "linear_probe_summary_test.csv"
-    print(f"output timing: mkdir_and_paths={time.perf_counter() - step_start:.2f}s", flush=True)
-
-    step_start = time.perf_counter()
-    with open(detailed_path, "w", encoding="utf-8") as f:
-        json.dump({"metadata": metadata, "results": results}, f, indent=2)
-    print(f"output timing: detailed_json_write={time.perf_counter() - step_start:.2f}s", flush=True)
-    write_summary_csv(results, summary_path)
-
-    step_start = time.perf_counter()
-    ok_count = sum(result["status"] == "ok" for result in results)
-    skipped_count = len(results) - ok_count
-    print(f"output timing: summarize_status={time.perf_counter() - step_start:.2f}s", flush=True)
-    print(f"Evaluated {ok_count} probes; skipped {skipped_count}.")
-    print(f"Saved detailed results to {detailed_path}")
-    print(f"Saved summary CSV to {summary_path}")
     print(f"Total time: {time.perf_counter() - run_start:.2f}s", flush=True)
+    print(json.dumps({"runs": run_summaries}, indent=2))
 
 
 if __name__ == "__main__":

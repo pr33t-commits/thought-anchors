@@ -14,7 +14,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[2]
 
 load_dotenv(PROJECT_ROOT / ".env")
 
-
+print(Path(__file__).resolve().parents[3] / "workspace/math_rollouts")
 PRESETS = {
     "local": {
         "chunk_input_dir": PROJECT_ROOT / "math_rollouts",
@@ -25,12 +25,12 @@ PRESETS = {
         "output_dir": SCRIPT_DIR / "Inputs",
     },
     "vm": {
-        "chunk_input_dir": Path("/home/lodaya_dimpal/storage/math_rollouts"),
-        "model": "deepseek-r1-distill-llama-8b",
-        "hf_model": "deepseek-ai/DeepSeek-R1-Distill-Llama-8B",
+        "chunk_input_dir":  Path(__file__).resolve().parents[3] / "workspace/math_rollouts",
+        "model": "deepseek-r1-distill-qwen-14b",
+        "hf_model": "deepseek-ai/DeepSeek-R1-Distill-Qwen-14B",
         "device": None,
         "device_map": "cuda",
-        "output_dir": Path("/home/lodaya_dimpal/storage/residual_stream_analysis/Inputs"),
+        "output_dir": SCRIPT_DIR / "Inputs",
     },
 }
 
@@ -423,15 +423,19 @@ def main() -> None:
 
     start_time = time.time()
     for problem_index, problem_id in enumerate(problem_ids, start=1):
+        
         problem_dir = input_dir / f"problem_{problem_id}"
         if not problem_dir.is_dir():
             print(f"Skipping missing problem directory: {problem_dir}", flush=True)
             continue
-
+        if problem_id not in ['1591', '2050', '2189', '2236', '2238', '2870', '330', '3448', '3916', '4605', '4682', '6481', '6998']:
+            print(f"Skipping problem {problem_dir} due to memory constraints")
+            continue
         output_path = build_problem_output_path(Path(output_dir), problem_id)
         step_start = time.perf_counter()
         output = load_existing_output(output_path, args.overwrite)
         log_problem_timing(problem_id, "load_existing_output", time.perf_counter() - step_start)
+        print(f"Check for overwrite logic :- {output.get("mean_vector",{}).keys()}")
         if (
             not args.overwrite
             and problem_id in output.get("mean_vector", {})

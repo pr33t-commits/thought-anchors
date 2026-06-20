@@ -14,12 +14,12 @@ PRESETS = {
     "local": {
         "output_dir": PROJECT_ROOT / "math_rollouts",
         "path_contains": None,
-        "model_path_contains": "deepseek-r1-distill-llama-8b",
+        "model_path_contains": "deepseek-r1-distill-qwen-14b",
     },
     "vm": {
-        "output_dir": Path("/home/lodaya_dimpal/storage/math_rollouts"),
+        "output_dir": PROJECT_ROOT / "math_rollouts",
         "path_contains": None,
-        "model_path_contains": None,
+        "model_path_contains": "deepseek-r1-distill-qwen-14b",
     },
 }
 
