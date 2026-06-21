@@ -6,15 +6,14 @@ import os
 import random
 from bisect import bisect_left
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 import numpy as np
 import torch
 from dotenv import load_dotenv
 from tqdm import tqdm
-from transformers import AutoModelForCausalLM, AutoTokenizer
 
-from utils import check_answer, extract_boxed_answers, split_solution_into_chunks
+from utils import check_answer, extract_boxed_answers, load_math_problems
 
 
 load_dotenv()
@@ -23,13 +22,6 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 HF_KEY = os.getenv("HF_TOKEN")
 
 DEFAULT_MODEL = "deepseek-ai/DeepSeek-R1-Distill-Qwen-14B"
-DEFAULT_INPUT_DIR = (
-    SCRIPT_DIR
-    / "math_rollouts"
-    / "deepseek-r1-distill-qwen-14b"
-    / "temperature_0.6_top_p_0.95"
-    / "correct_base_solution"
-)
 DEFAULT_OUTPUT_DIR = (
     SCRIPT_DIR
     / "math_rollouts_steered"
@@ -53,13 +45,35 @@ DEFAULT_SCALING_CSV = (
     / "Inputs"
     / "tag_wise_scaling.csv"
 )
+HARDCODED_PROBLEM_IDS = [
+    330,
+    1591,
+    2050,
+    2137,
+    2189,
+    2236,
+    2238,
+    2870,
+    3360,
+    3448,
+    3550,
+    3916,
+    3935,
+    4019,
+    4164,
+    4605,
+    4682,
+    6481,
+    6596,
+    6998,
+]
 STEERING_TAGS = ("plan_generation", "uncertainty_management", "fact_retrieval")
 DEFAULT_SELECTION_STRATEGY = "best_overall_f1"
 SUPPORTED_REGRESSOR_TYPE = "multinomial"
 
 
 class StreamingChunkContext:
-    """Tracks generated chunks using the same boundary rules as split_solution_into_chunks."""
+    """Tracks generated chunks from streamed text using lightweight sentence boundaries."""
 
     def __init__(self, chunk_min: int = 0, chunk_max: int = 250):
         self.chunk_min = chunk_min
@@ -140,9 +154,23 @@ def char_is_boundary_space(char: str) -> bool:
     return char == " " or char == "\n"
 
 
+def parse_layer_list(value: Optional[str]) -> Optional[List[int]]:
+    if value is None:
+        return None
+    layers = []
+    for item in value.split(","):
+        item = item.strip()
+        if not item:
+            continue
+        layers.append(int(item))
+    return sorted(set(layers))
+
+
 class TagWiseScaling:
     def __init__(self, csv_path: Path, tags: Iterable[str]):
         self.values: Dict[str, List[Tuple[float, float]]] = {tag: [] for tag in tags}
+        tags = tuple(tags)
+        rows_by_x: Dict[float, Dict[str, float]] = {}
         with open(csv_path, "r", encoding="utf-8") as f:
             reader = csv.DictReader(f)
             for row in reader:
@@ -154,20 +182,26 @@ class TagWiseScaling:
                     y = float(row["counterfactual_importance_kl"])
                 except (KeyError, TypeError, ValueError):
                     continue
-                self.values[tag].append((x, y))
+                rows_by_x.setdefault(x, {})[tag] = max(y, 0.0)
+
+        for x in sorted(rows_by_x):
+            values_at_x = rows_by_x[x]
+            total = sum(values_at_x.get(tag, 0.0) for tag in tags)
+            if total > 0:
+                normalized = {
+                    tag: values_at_x.get(tag, 0.0) / total
+                    for tag in tags
+                }
+            else:
+                uniform = 1.0 / len(tags)
+                normalized = {tag: uniform for tag in tags}
+
+            for tag in tags:
+                self.values[tag].append((x, float(normalized[tag])))
 
         for tag, rows in self.values.items():
-            rows.sort(key=lambda item: item[0])
             if not rows:
                 raise ValueError(f"No scaling rows found for function_tag={tag!r} in {csv_path}")
-            raw = [value for _, value in rows]
-            min_value = min(raw)
-            max_value = max(raw)
-            denom = max_value - min_value
-            self.values[tag] = [
-                (x, 0.0 if denom == 0 else (value - min_value) / denom)
-                for x, value in rows
-            ]
 
     def ratio(self, tag: str, chunk_idx_scaled: float) -> float:
         rows = self.values[tag]
@@ -202,15 +236,18 @@ class SteeringRule:
         steering_vectors_path: Path,
         scaling_csv_path: Path,
         selection_strategy: str,
+        steering_layers: Optional[Sequence[int]],
         strength_n: float,
         device: torch.device,
         dtype: torch.dtype,
     ):
         self.scaling = TagWiseScaling(scaling_csv_path, STEERING_TAGS)
         self.strength_n = strength_n
+        self.requested_layers = None if steering_layers is None else sorted(set(int(layer) for layer in steering_layers))
         self.directions = self._load_directions(
             steering_vectors_path=steering_vectors_path,
             selection_strategy=selection_strategy,
+            steering_layers=self.requested_layers,
             device=device,
             dtype=dtype,
         )
@@ -219,6 +256,7 @@ class SteeringRule:
         self,
         steering_vectors_path: Path,
         selection_strategy: str,
+        steering_layers: Optional[Sequence[int]],
         device: torch.device,
         dtype: torch.dtype,
     ) -> Dict[str, Dict[int, torch.Tensor]]:
@@ -241,11 +279,14 @@ class SteeringRule:
         if not isinstance(strategy_records, list):
             raise ValueError(f"results[{selection_strategy!r}] must be a list of probe records.")
 
+        requested_layer_set = None if steering_layers is None else {int(layer) for layer in steering_layers}
         directions: Dict[str, Dict[int, torch.Tensor]] = {tag: {} for tag in STEERING_TAGS}
         for record in strategy_records:
             if record.get("regressor_type") != SUPPORTED_REGRESSOR_TYPE:
                 continue
             layer = normalize_layer_key(record["layer"])
+            if requested_layer_set is not None and layer not in requested_layer_set:
+                continue
             weights_by_class = record.get("weights_by_class", {})
             if not isinstance(weights_by_class, dict):
                 continue
@@ -253,6 +294,17 @@ class SteeringRule:
                 if tag not in weights_by_class:
                     continue
                 directions[tag][layer] = vector_to_tensor(weights_by_class[tag], device=device, dtype=dtype)
+
+        if requested_layer_set is not None:
+            available_layers = set()
+            for tag_map in directions.values():
+                available_layers.update(tag_map)
+            missing_layers = sorted(requested_layer_set - available_layers)
+            if missing_layers:
+                raise KeyError(
+                    f"Requested steering layers {missing_layers} are not available in "
+                    f"{steering_vectors_path} for selection strategy {selection_strategy!r}."
+                )
 
         missing_tags = [tag for tag, layer_map in directions.items() if not layer_map]
         if missing_tags:
@@ -282,66 +334,36 @@ class SteeringRule:
         return decay * torch.stack(pieces, dim=0).sum(dim=0)
 
 
-class ResidualSteeringHook:
-    def __init__(self, model: torch.nn.Module, rule: SteeringRule, context: StreamingChunkContext):
-        self.model = model
-        self.rule = rule
-        self.context = context
-        self.handles = []
-        self.enabled = False
+def make_residual_steering_hook(
+    layer_idx: int,
+    rule: SteeringRule,
+    context: StreamingChunkContext,
+    hook_call_counts: Dict[int, int],
+    hook_seen_chunk_scales: Dict[int, List[float]],
+):
+    def hook_fn(residual: torch.Tensor, hook) -> torch.Tensor:
+        del hook
+        hook_call_counts[layer_idx] = hook_call_counts.get(layer_idx, 0) + 1
+        scale = float(context.chunk_idx_scaled)
+        scales_for_layer = hook_seen_chunk_scales.setdefault(layer_idx, [])
+        if not scales_for_layer or not math.isclose(scales_for_layer[-1], scale, rel_tol=0.0, abs_tol=1e-12):
+            scales_for_layer.append(scale)
 
-    def _hook(self, layer_idx: int):
-        def hook_fn(module, input_tuple, output):
-            if not self.enabled:
-                return output
-            if isinstance(output, tuple):
-                hidden_states = output[0]
-                rest = output[1:]
-            else:
-                hidden_states = output
-                rest = ()
-
-            vector = self.rule.vector_for_layer(layer_idx, self.context.chunk_idx_scaled)
-            if vector is None:
-                return output
-            vector = vector.to(device=hidden_states.device, dtype=hidden_states.dtype)
-            if vector.numel() != hidden_states.shape[-1]:
-                raise ValueError(
-                    f"Steering vector dim {vector.numel()} does not match hidden dim "
-                    f"{hidden_states.shape[-1]} at layer {layer_idx}"
-                )
-
-            modified = hidden_states.clone()
-            modified[:, -1, :] = modified[:, -1, :] + vector
-            if rest:
-                return (modified,) + rest
-            return modified
-
-        return hook_fn
-
-    def register(self) -> None:
-        self.remove()
-        layer_modules = find_decoder_layers(self.model)
-        missing_layers = [layer for layer in self.rule.layers if layer >= len(layer_modules)]
-        if missing_layers:
+        vector = rule.vector_for_layer(layer_idx, context.chunk_idx_scaled)
+        if vector is None:
+            return residual
+        vector = vector.to(device=residual.device, dtype=residual.dtype)
+        if vector.numel() != residual.shape[-1]:
             raise ValueError(
-                f"Requested steering layers {missing_layers} but model has {len(layer_modules)} layers"
+                f"Steering vector dim {vector.numel()} does not match hidden dim "
+                f"{residual.shape[-1]} at layer {layer_idx}"
             )
-        for layer_idx in self.rule.layers:
-            self.handles.append(layer_modules[layer_idx].register_forward_hook(self._hook(layer_idx)))
 
-    def remove(self) -> None:
-        for handle in self.handles:
-            handle.remove()
-        self.handles = []
+        updated = residual.clone()
+        updated[:, -1, :] = updated[:, -1, :] + vector
+        return updated
 
-
-def find_decoder_layers(model: torch.nn.Module) -> torch.nn.ModuleList:
-    if hasattr(model, "model") and hasattr(model.model, "layers"):
-        return model.model.layers
-    if hasattr(model, "transformer") and hasattr(model.transformer, "h"):
-        return model.transformer.h
-    raise ValueError("Could not locate decoder layers on the local model.")
+    return hook_fn
 
 
 def sample_next_token(logits: torch.Tensor, temperature: float, top_p: float, top_k: Optional[int]) -> torch.Tensor:
@@ -367,94 +389,142 @@ def sample_next_token(logits: torch.Tensor, temperature: float, top_p: float, to
 
 
 def generate_steered(
-    model: torch.nn.Module,
-    tokenizer: Any,
+    model: Any,
     prompt: str,
-    rule: SteeringRule,
+    rule: Optional[SteeringRule],
     max_tokens: int,
     temperature: float,
     top_p: float,
     top_k: Optional[int],
 ) -> Dict[str, Any]:
-    inputs = tokenizer(prompt, return_tensors="pt")
-    device = next(model.parameters()).device
-    input_ids = inputs["input_ids"].to(device)
-    attention_mask = inputs.get("attention_mask")
-    if attention_mask is not None:
-        attention_mask = attention_mask.to(device)
-
     context = StreamingChunkContext()
-    hook = ResidualSteeringHook(model, rule, context)
-    hook.register()
-    hook.enabled = True
+    prompt_tokens = model.to_tokens(prompt)
+    prompt_len = int(prompt_tokens.shape[1])
+    hook_call_counts: Dict[int, int] = {}
+    hook_seen_chunk_scales: Dict[int, List[float]] = {}
+    chunk_transitions: List[Dict[str, Any]] = []
 
+    hook_specs = []
+    if rule is not None:
+        hook_specs = [
+            (
+                f"blocks.{layer_idx}.hook_resid_post",
+                make_residual_steering_hook(
+                    layer_idx,
+                    rule,
+                    context,
+                    hook_call_counts,
+                    hook_seen_chunk_scales,
+                ),
+            )
+            for layer_idx in rule.layers
+        ]
     generated_ids: List[int] = []
-    past_key_values = None
-    next_input_ids = input_ids
-    eos_ids = {tokenizer.eos_token_id}
-    if getattr(tokenizer, "pad_token_id", None) is not None:
-        eos_ids.discard(tokenizer.pad_token_id)
+    eos_ids = {model.tokenizer.eos_token_id}
+    if getattr(model.tokenizer, "pad_token_id", None) is not None:
+        eos_ids.discard(model.tokenizer.pad_token_id)
+    tokens = prompt_tokens
 
-    try:
-        for step in range(max_tokens):
+    with model.hooks(fwd_hooks=hook_specs):
+        for _ in range(max_tokens):
             with torch.no_grad():
-                outputs = model(
-                    input_ids=next_input_ids,
-                    attention_mask=attention_mask if past_key_values is None else None,
-                    past_key_values=past_key_values,
-                    use_cache=True,
-                )
-            past_key_values = outputs.past_key_values
-            next_token = sample_next_token(outputs.logits[:, -1, :], temperature, top_p, top_k)
-            token_id = int(next_token.item())
+                logits = model(tokens, return_type="logits")
+            next_token = sample_next_token(logits[:, -1, :], temperature, top_p, top_k)
+            token_id = int(next_token[0, 0].item())
             if token_id in eos_ids:
                 break
-            generated_ids.append(token_id)
-            token_text = tokenizer.decode([token_id], skip_special_tokens=True)
-            context.feed(token_text)
-            next_input_ids = next_token
-    finally:
-        hook.remove()
 
-    rollout_text = tokenizer.decode(generated_ids, skip_special_tokens=True)
+            generated_ids.append(token_id)
+            token_text = model.tokenizer.decode([token_id], skip_special_tokens=True)
+            previous_chunk_count = context.num_chunks_generated
+            context.feed(token_text)
+            if context.num_chunks_generated > previous_chunk_count:
+                chunk_transitions.append(
+                    {
+                        "completion_tokens_after_feed": len(generated_ids),
+                        "num_chunks_generated": context.num_chunks_generated,
+                        "chunk_idx_scaled": float(context.chunk_idx_scaled),
+                    }
+                )
+            tokens = torch.cat([tokens, next_token.to(tokens.device)], dim=1)
+
+    if rule is not None and generated_ids:
+        layers_without_calls = [layer_idx for layer_idx in rule.layers if hook_call_counts.get(layer_idx, 0) == 0]
+        if layers_without_calls:
+            raise RuntimeError(
+                f"Steering hooks were registered but never invoked for layers {layers_without_calls}."
+            )
+
+    chunk_transition_verification = []
+    for event in chunk_transitions:
+        should_affect_future_tokens = event["completion_tokens_after_feed"] < len(generated_ids)
+        if rule is None or not should_affect_future_tokens:
+            verification_passed = True
+        else:
+            verification_passed = all(
+                any(
+                    math.isclose(scale, event["chunk_idx_scaled"], rel_tol=0.0, abs_tol=1e-12)
+                    for scale in hook_seen_chunk_scales.get(layer_idx, [])
+                )
+                for layer_idx in rule.layers
+            )
+        chunk_transition_verification.append(
+            {
+                **event,
+                "should_affect_future_tokens": should_affect_future_tokens,
+                "verified_next_step_used_new_scale": verification_passed,
+            }
+        )
+
+    rollout_text = model.tokenizer.decode(generated_ids, skip_special_tokens=True)
     return {
         "text": rollout_text,
         "finish_reason": "length" if len(generated_ids) >= max_tokens else "stop",
-        "usage": {"completion_tokens": len(generated_ids), "total_tokens": input_ids.shape[1] + len(generated_ids)},
+        "usage": {"completion_tokens": len(generated_ids), "total_tokens": prompt_len + len(generated_ids)},
         "chunk_context": context.snapshot(),
+        "steering_debug": {
+            "enabled": rule is not None,
+            "hook_layers": [] if rule is None else list(rule.layers),
+            "hook_call_counts": {str(layer): count for layer, count in sorted(hook_call_counts.items())},
+            "hook_seen_chunk_scales": {
+                str(layer): scales for layer, scales in sorted(hook_seen_chunk_scales.items())
+            },
+            "chunk_transitions": chunk_transition_verification,
+            "use_past_kv_cache": False,
+        },
     }
 
 
-def load_local_model(args: argparse.Namespace) -> Tuple[torch.nn.Module, Any]:
-    tokenizer = AutoTokenizer.from_pretrained(
+def load_local_model(args: argparse.Namespace) -> Any:
+    try:
+        from transformer_lens import HookedTransformer
+    except ImportError as exc:
+        raise ImportError(
+            "transformer_lens is required for generate_rollouts_steered.py. "
+            "Install it in this environment before running the script."
+        ) from exc
+
+    if args.quantize:
+        raise NotImplementedError("`--quantize` is not supported with the TransformerLens loading path.")
+
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    dtype = torch.float16 if torch.cuda.is_available() else torch.float32
+    model = HookedTransformer.from_pretrained_no_processing(
         args.model,
+        device=device,
+        dtype=dtype,
+        default_padding_side="left",
+        fold_ln=False,
+        center_writing_weights=False,
+        center_unembed=False,
+        refactor_factored_attn_matrices=False,
         token=HF_KEY,
         trust_remote_code=True,
-        use_fast=True,
     )
-    if tokenizer.pad_token_id is None:
-        tokenizer.pad_token_id = tokenizer.eos_token_id
-
-    load_kwargs = {
-        "token": HF_KEY,
-        "trust_remote_code": True,
-        "device_map": "auto" if torch.cuda.is_available() else None,
-    }
-    if torch.cuda.is_available():
-        load_kwargs["torch_dtype"] = torch.float16
-    if args.quantize and torch.cuda.is_available():
-        from transformers import BitsAndBytesConfig
-
-        load_kwargs["quantization_config"] = BitsAndBytesConfig(
-            load_in_4bit=True,
-            bnb_4bit_compute_dtype=torch.float16,
-            bnb_4bit_quant_type="nf4",
-            bnb_4bit_use_double_quant=True,
-        )
-
-    model = AutoModelForCausalLM.from_pretrained(args.model, **load_kwargs)
     model.eval()
-    return model, tokenizer
+    if model.tokenizer is not None and model.tokenizer.pad_token_id is None:
+        model.tokenizer.pad_token_id = model.tokenizer.eos_token_id
+    return model
 
 
 def read_json(path: Path) -> Any:
@@ -468,126 +538,118 @@ def write_json(path: Path, value: Any) -> None:
         json.dump(value, f, indent=2)
 
 
-def discover_problem_dirs(input_dir: Path, include_problems: Optional[str]) -> List[Path]:
+def discover_problem_dirs(include_problems: Optional[str]) -> List[Path]:
+    available_problem_ids = HARDCODED_PROBLEM_IDS
     if include_problems:
         wanted = {item.strip().removeprefix("problem_") for item in include_problems.split(",") if item.strip()}
-        return [input_dir / f"problem_{problem_id}" for problem_id in sorted(wanted, key=lambda x: int(x))]
-    return sorted(input_dir.glob("problem_*"), key=lambda path: int(path.name.removeprefix("problem_")))
+        missing_problem_ids = sorted(int(problem_id) for problem_id in wanted if int(problem_id) not in available_problem_ids)
+        if missing_problem_ids:
+            raise KeyError(
+                f"Requested include_problems IDs are not in the hardcoded problem set: {missing_problem_ids}"
+            )
+        problem_ids = sorted(int(problem_id) for problem_id in wanted)
+    else:
+        problem_ids = list(available_problem_ids)
+    return [Path(f"problem_{problem_id}") for problem_id in problem_ids]
 
 
-def build_cumulative_chunks(chunks: List[str]) -> List[str]:
-    cumulative = []
-    current = ""
-    for chunk in chunks:
-        current += chunk + " "
-        cumulative.append(current.strip())
-    return cumulative
+def load_problem_map(problem_dirs: Sequence[Path], split: str) -> Dict[str, Dict[str, Any]]:
+    problem_ids = [int(path.name.removeprefix("problem_")) for path in problem_dirs]
+    loaded = load_math_problems(
+        split=split,
+        include_problems=problem_ids,
+        num_problems=None,
+        hf_key=HF_KEY,
+    )
+    return {str(problem_idx): problem for problem_idx, problem in loaded}
 
 
-def rollout_prompt(problem: Dict[str, Any], prefix_without_chunk: str) -> str:
+def rollout_prompt(problem: Dict[str, Any]) -> str:
     return (
         "Solve this math problem step by step. You MUST put your final answer in \\boxed{}. "
-        f"Problem: {problem['problem']} Solution: \n<think>\n{prefix_without_chunk}"
+        f"Problem: {problem['problem']} Solution: \n<think>\n"
     )
 
 
-def copy_problem_inputs(source_problem_dir: Path, output_problem_dir: Path, force: bool) -> Tuple[Dict[str, Any], List[str]]:
-    problem = read_json(source_problem_dir / "problem.json")
-    chunks_data = read_json(source_problem_dir / "chunks.json")
-    for filename in ("problem.json", "base_solution.json", "chunks.json"):
-        source = source_problem_dir / filename
-        target = output_problem_dir / filename
-        if source.is_file() and (force or not target.exists()):
-            write_json(target, read_json(source))
-    return problem, chunks_data["chunks"]
+def write_problem_metadata(problem: Dict[str, Any], output_problem_dir: Path, force: bool) -> None:
+    problem_file = output_problem_dir / "problem.json"
+    if force or not problem_file.exists():
+        write_json(problem_file, problem)
 
 
 def process_problem_dir(
     problem_dir: Path,
+    problem: Dict[str, Any],
     output_dir: Path,
-    model: torch.nn.Module,
-    tokenizer: Any,
-    rule: SteeringRule,
+    model: Any,
+    rule: Optional[SteeringRule],
     args: argparse.Namespace,
 ) -> None:
     problem_id = problem_dir.name.removeprefix("problem_")
     output_problem_dir = output_dir / problem_dir.name
-    problem, chunks = copy_problem_inputs(problem_dir, output_problem_dir, args.force)
-    cumulative_chunks = build_cumulative_chunks(chunks)
+    write_problem_metadata(problem, output_problem_dir, args.force)
+    solutions_file = output_problem_dir / "solutions.json"
+    existing_solutions = []
+    if solutions_file.exists() and not args.force:
+        existing_solutions = read_json(solutions_file)
 
-    chunk_iter = list(enumerate(zip(chunks, cumulative_chunks)))
-    if args.include_chunks:
-        wanted_chunks = {int(item.strip()) for item in args.include_chunks.split(",") if item.strip()}
-        chunk_iter = [(idx, pair) for idx, pair in chunk_iter if idx in wanted_chunks]
-    if args.max_chunks is not None:
-        chunk_iter = [(idx, pair) for idx, pair in chunk_iter if idx < args.max_chunks]
+    valid_existing = [solution for solution in existing_solutions if "error" not in solution]
+    needed = args.num_rollouts - len(valid_existing)
+    if needed <= 0:
+        return
 
-    for chunk_idx, (chunk, full_prefix) in tqdm(chunk_iter, desc=f"problem_{problem_id} chunks"):
-        chunk_dir = output_problem_dir / f"chunk_{chunk_idx}"
-        solutions_file = chunk_dir / "solutions.json"
-        existing_solutions = []
-        if solutions_file.exists() and not args.force:
-            existing_solutions = read_json(solutions_file)
+    prompt = rollout_prompt(problem)
+    new_solutions = []
+    for _ in tqdm(range(needed), desc=f"problem_{problem_id} rollouts", leave=False):
+        try:
+            result = generate_steered(
+                model=model,
+                prompt=prompt,
+                rule=rule,
+                max_tokens=args.max_tokens,
+                temperature=args.temperature,
+                top_p=args.top_p,
+                top_k=args.top_k,
+            )
+            rollout_text = result["text"]
+            extracted_answers = extract_boxed_answers(rollout_text)
+            answer = extracted_answers[0] if extracted_answers else ""
+            is_correct = bool(problem.get("gt_answer") and answer and check_answer(answer, problem["gt_answer"]))
 
-        valid_existing = [solution for solution in existing_solutions if "error" not in solution]
-        needed = args.num_rollouts - len(valid_existing)
-        if needed <= 0:
-            continue
+            new_solutions.append(
+                {
+                    "prompt": prompt,
+                    "rollout": rollout_text,
+                    "full_cot": f"{prompt}{rollout_text}",
+                    "answer": answer,
+                    "is_correct": is_correct,
+                    "steered_chunks": result["chunk_context"]["chunks"],
+                    "chunk_context": result["chunk_context"],
+                    "steering_debug": result["steering_debug"],
+                }
+            )
+        except Exception as exc:
+            new_solutions.append(
+                {
+                    "prompt": prompt,
+                    "error": str(exc),
+                }
+            )
 
-        prefix_without_chunk = full_prefix.replace(chunk, "").strip()
-        prompt = rollout_prompt(problem, prefix_without_chunk)
-        new_solutions = []
-
-        for _ in tqdm(range(needed), desc=f"problem_{problem_id} chunk_{chunk_idx} rollouts", leave=False):
-            try:
-                result = generate_steered(
-                    model=model,
-                    tokenizer=tokenizer,
-                    prompt=prompt,
-                    rule=rule,
-                    max_tokens=args.max_tokens,
-                    temperature=args.temperature,
-                    top_p=args.top_p,
-                    top_k=args.top_k,
-                )
-                rollout_text = result["text"]
-                generated_chunks = result["chunk_context"]["chunks"]
-                fallback_chunks = split_solution_into_chunks(rollout_text) if rollout_text else []
-                chunk_resampled = (generated_chunks or fallback_chunks or [""])[0]
-                extracted_answers = extract_boxed_answers(rollout_text)
-                answer = extracted_answers[0] if extracted_answers else ""
-                is_correct = bool(problem.get("gt_answer") and answer and check_answer(answer, problem["gt_answer"]))
-
-                new_solutions.append(
-                    {
-                        "chunk_removed": chunk,
-                        "prefix_without_chunk": prefix_without_chunk,
-                        "chunk_resampled": chunk_resampled,
-                        "rollout": rollout_text,
-                        "full_cot": f"{prompt}{rollout_text}",
-                        "answer": answer,
-                        "is_correct": is_correct,
-                        "steered_chunks": generated_chunks,
-                        "chunk_context": result["chunk_context"],
-                    }
-                )
-            except Exception as exc:
-                new_solutions.append(
-                    {
-                        "chunk_removed": chunk,
-                        "prefix_without_chunk": prefix_without_chunk,
-                        "error": str(exc),
-                    }
-                )
-
-        write_json(solutions_file, existing_solutions + new_solutions)
+    write_json(solutions_file, existing_solutions + new_solutions)
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Generate local rollouts with residual stream steering.")
     parser.add_argument("--model", type=str, default=DEFAULT_MODEL)
-    parser.add_argument("--input_dir", type=Path, default=DEFAULT_INPUT_DIR)
     parser.add_argument("--output_dir", type=Path, default=DEFAULT_OUTPUT_DIR)
+    parser.add_argument(
+        "--split",
+        type=str,
+        default="train",
+        choices=["train", "test"],
+        help="Hugging Face MATH split to load problem statements from.",
+    )
     parser.add_argument("--steering_vectors", type=Path, default=DEFAULT_STEERING_VECTOR_PATH)
     parser.add_argument("--scaling_csv", type=Path, default=DEFAULT_SCALING_CSV)
     parser.add_argument(
@@ -597,17 +659,26 @@ def parse_args() -> argparse.Namespace:
         choices=["best_overall_f1", "best_overall_recall", "best_class_f1", "best_class_recall"],
         help="Selection strategy key to read from linear_probe_results_test.json.",
     )
+    parser.add_argument(
+        "--steering_layers",
+        type=str,
+        default=None,
+        help="Comma-separated layer numbers to steer. Default is all available steering layers.",
+    )
+    parser.add_argument(
+        "--disable_steering",
+        action="store_true",
+        help="Generate normal rollouts without applying steering hooks.",
+    )
     parser.add_argument("-n", "--strength_n", type=float, default=1.0)
     parser.add_argument("-nr", "--num_rollouts", type=int, default=100)
     parser.add_argument("-t", "--temperature", type=float, default=0.6)
     parser.add_argument("-tp", "--top_p", type=float, default=0.95)
     parser.add_argument("-tk", "--top_k", type=int, default=None)
     parser.add_argument("-mt", "--max_tokens", type=int, default=16384)
-    parser.add_argument("-mc", "--max_chunks", type=int, default=275)
     parser.add_argument("-s", "--seed", type=int, default=44)
     parser.add_argument("-f", "--force", action="store_true")
     parser.add_argument("-ip", "--include_problems", type=str, default=None)
-    parser.add_argument("-ic", "--include_chunks", type=str, default=None)
     parser.add_argument("-q", "--quantize", action="store_true")
     return parser.parse_args()
 
@@ -621,33 +692,48 @@ def main() -> None:
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(args.seed)
 
-    if not args.steering_vectors.is_file():
-        raise FileNotFoundError(f"Steering vectors file not found: {args.steering_vectors}")
-    if not args.scaling_csv.is_file():
-        raise FileNotFoundError(f"Scaling CSV not found: {args.scaling_csv}")
+    if not args.disable_steering:
+        if not args.steering_vectors.is_file():
+            raise FileNotFoundError(f"Steering vectors file not found: {args.steering_vectors}")
+        if not args.scaling_csv.is_file():
+            raise FileNotFoundError(f"Scaling CSV not found: {args.scaling_csv}")
 
     print(f"Loading local model: {args.model}")
-    model, tokenizer = load_local_model(args)
+    model = load_local_model(args)
     dtype = next(model.parameters()).dtype
     device = next(model.parameters()).device
-    rule = SteeringRule(
-        steering_vectors_path=args.steering_vectors,
-        scaling_csv_path=args.scaling_csv,
-        selection_strategy=args.selection_strategy,
-        strength_n=args.strength_n,
-        device=device,
-        dtype=dtype,
-    )
+    steering_layers = parse_layer_list(args.steering_layers)
+    rule = None
+    if not args.disable_steering:
+        rule = SteeringRule(
+            steering_vectors_path=args.steering_vectors,
+            scaling_csv_path=args.scaling_csv,
+            selection_strategy=args.selection_strategy,
+            steering_layers=steering_layers,
+            strength_n=args.strength_n,
+            device=device,
+            dtype=dtype,
+        )
 
-    problem_dirs = discover_problem_dirs(args.input_dir, args.include_problems)
-    problem_dirs = [path for path in problem_dirs if path.is_dir()]
+    problem_dirs = discover_problem_dirs(args.include_problems)
     if not problem_dirs:
-        raise FileNotFoundError(f"No problem_* directories found in {args.input_dir}")
+        raise FileNotFoundError("No problem IDs available in the hardcoded problem set.")
+    problem_map = load_problem_map(problem_dirs, args.split)
+    missing_problem_ids = [
+        path.name.removeprefix("problem_")
+        for path in problem_dirs
+        if path.name.removeprefix("problem_") not in problem_map
+    ]
+    if missing_problem_ids:
+        raise KeyError(
+            f"Failed to load these problem IDs from Hugging Face split {args.split!r}: {missing_problem_ids}"
+        )
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
     print(f"Writing steered rollouts to: {args.output_dir}")
     for problem_dir in tqdm(problem_dirs, desc="problems"):
-        process_problem_dir(problem_dir, args.output_dir, model, tokenizer, rule, args)
+        problem_id = problem_dir.name.removeprefix("problem_")
+        process_problem_dir(problem_dir, problem_map[problem_id], args.output_dir, model, rule, args)
 
 
 if __name__ == "__main__":
