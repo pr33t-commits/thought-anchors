@@ -21,7 +21,7 @@ load_dotenv()
 SCRIPT_DIR = Path(__file__).resolve().parent
 HF_KEY = os.getenv("HF_TOKEN")
 
-DEFAULT_MODEL = "deepseek-ai/DeepSeek-R1-Distill-Qwen-14B"
+DEFAULT_MODEL = "deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B"
 DEFAULT_OUTPUT_DIR = (
     SCRIPT_DIR
     / "math_rollouts_steered"
@@ -35,7 +35,7 @@ DEFAULT_STEERING_VECTOR_PATH = (
     / "residual_stream_analysis"
     / "Results"
     / "linear_probes"
-    / "last_tokenvector"
+    / "mean_vector"
     / "linear_probe_results_test.json"
 )
 DEFAULT_SCALING_CSV = (
@@ -47,25 +47,25 @@ DEFAULT_SCALING_CSV = (
 )
 HARDCODED_PROBLEM_IDS = [
     330,
-    1591,
-    2050,
-    2137,
-    2189,
-    2236,
-    2238,
-    2870,
-    3360,
-    3448,
-    3550,
-    3916,
-    3935,
-    4019,
-    4164,
-    4605,
-    4682,
-    6481,
-    6596,
-    6998,
+    # 1591,
+    # 2050,
+    # 2137,
+    # 2189,
+    # 2236,
+    # 2238,
+    # 2870,
+    # 3360,
+    # 3448,
+    # 3550,
+    # 3916,
+    # 3935,
+    # 4019,
+    # 4164,
+    # 4605,
+    # 4682,
+    # 6481,
+    # 6596,
+    # 6998,
 ]
 STEERING_TAGS = ("plan_generation", "uncertainty_management", "fact_retrieval")
 DEFAULT_SELECTION_STRATEGY = "best_overall_f1"
@@ -181,6 +181,7 @@ class TagWiseScaling:
                     x = float(row["chunk_idx_scaled"])
                     y = float(row["counterfactual_importance_kl"])
                 except (KeyError, TypeError, ValueError):
+                    print(f'Failing here :- reading inter-tag scaling ratio', flush = True)
                     continue
                 rows_by_x.setdefault(x, {})[tag] = max(y, 0.0)
 
@@ -301,7 +302,10 @@ class SteeringRule:
             for tag in STEERING_TAGS:
                 if tag not in weights_by_class:
                     continue
-                directions[tag][layer] = vector_to_tensor(weights_by_class[tag], device=device, dtype=dtype)
+                
+                directions[tag][layer] = vector_to_tensor(weights_by_class[tag][:1536], 
+                                                          device=device, 
+                                                          dtype=dtype)
 
         if requested_layer_set is not None:
             available_layers = set()
@@ -349,6 +353,7 @@ def make_residual_steering_hook(
     hook_call_counts: Dict[int, int],
     hook_seen_chunk_scales: Dict[int, List[float]],
 ):
+    print(f"In the hook function for layer : {layer_idx}, for chunk id : {context.chunk_idx_scaled}", flush = True)
     def hook_fn(residual: torch.Tensor, hook) -> torch.Tensor:
         del hook
         hook_call_counts[layer_idx] = hook_call_counts.get(layer_idx, 0) + 1
@@ -436,9 +441,12 @@ def generate_steered(
     tokens = prompt_tokens
 
     with model.hooks(fwd_hooks=hook_specs):
-        for _ in range(max_tokens):
+        for i in range(max_tokens):
+            print(f"Generating token number {i + 1}", flush = True)
             with torch.no_grad():
                 logits = model(tokens, return_type="logits")
+            # import pandas as pd
+            # print(f"Logit distribution :- {pd.Series(logits[0,-1,:]).describe()}",flush = True)
             next_token = sample_next_token(logits[:, -1, :], temperature, top_p, top_k)
             token_id = int(next_token[0, 0].item())
             if token_id in eos_ids:
@@ -508,6 +516,7 @@ def generate_steered(
 def load_local_model(args: argparse.Namespace) -> Any:
     try:
         from transformer_lens import HookedTransformer
+        from transformer_lens.model_bridge import TransformerBridge
     except ImportError as exc:
         raise ImportError(
             "transformer_lens is required for generate_rollouts_steered.py. "
@@ -519,18 +528,28 @@ def load_local_model(args: argparse.Namespace) -> Any:
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
     dtype = torch.float16 if torch.cuda.is_available() else torch.float32
-    model = HookedTransformer.from_pretrained_no_processing(
-        args.model,
-        device=device,
+    # model = HookedTransformer.from_pretrained_no_processing(
+    #     args.model,
+    #     device=device,
+    #     dtype=dtype,
+    #     default_padding_side="left",
+    #     fold_ln=False,
+    #     center_writing_weights=False,
+    #     center_unembed=False,
+    #     refactor_factored_attn_matrices=False,
+    #     token=HF_KEY,
+    #     trust_remote_code=True,
+    # )
+    model = TransformerBridge.boot_transformers(args.model, 
+                                               device=device,
         dtype=dtype,
-        default_padding_side="left",
-        fold_ln=False,
-        center_writing_weights=False,
-        center_unembed=False,
-        refactor_factored_attn_matrices=False,
-        token=HF_KEY,
-        trust_remote_code=True,
-    )
+        # default_padding_side="left",
+        # fold_ln=False,
+        # center_writing_weights=False,
+        # center_unembed=False,
+        # refactor_factored_attn_matrices=False,
+        # token=HF_KEY,
+        trust_remote_code=True)
     model.eval()
     if model.tokenizer is not None and model.tokenizer.pad_token_id is None:
         model.tokenizer.pad_token_id = model.tokenizer.eos_token_id
@@ -611,40 +630,40 @@ def process_problem_dir(
     prompt = rollout_prompt(problem)
     new_solutions = []
     for _ in tqdm(range(needed), desc=f"problem_{problem_id} rollouts", leave=False):
-        try:
-            result = generate_steered(
-                model=model,
-                prompt=prompt,
-                rule=rule,
-                max_tokens=args.max_tokens,
-                temperature=args.temperature,
-                top_p=args.top_p,
-                top_k=args.top_k,
-            )
-            rollout_text = result["text"]
-            extracted_answers = extract_boxed_answers(rollout_text)
-            answer = extracted_answers[0] if extracted_answers else ""
-            is_correct = bool(problem.get("gt_answer") and answer and check_answer(answer, problem["gt_answer"]))
+        # try:
+        result = generate_steered(
+            model=model,
+            prompt=prompt,
+            rule=rule,
+            max_tokens=args.max_tokens,
+            temperature=args.temperature,
+            top_p=args.top_p,
+            top_k=args.top_k,
+        )
+        rollout_text = result["text"]
+        extracted_answers = extract_boxed_answers(rollout_text)
+        answer = extracted_answers[0] if extracted_answers else ""
+        is_correct = bool(problem.get("gt_answer") and answer and check_answer(answer, problem["gt_answer"]))
 
-            new_solutions.append(
-                {
-                    "prompt": prompt,
-                    "rollout": rollout_text,
-                    "full_cot": f"{prompt}{rollout_text}",
-                    "answer": answer,
-                    "is_correct": is_correct,
-                    "steered_chunks": result["chunk_context"]["chunks"],
-                    "chunk_context": result["chunk_context"],
-                    "steering_debug": result["steering_debug"],
-                }
-            )
-        except Exception as exc:
-            new_solutions.append(
-                {
-                    "prompt": prompt,
-                    "error": str(exc),
-                }
-            )
+        new_solutions.append(
+            {
+                "prompt": prompt,
+                "rollout": rollout_text,
+                "full_cot": f"{prompt}{rollout_text}",
+                "answer": answer,
+                "is_correct": is_correct,
+                "steered_chunks": result["chunk_context"]["chunks"],
+                "chunk_context": result["chunk_context"],
+                "steering_debug": result["steering_debug"],
+            }
+        )
+        # except Exception as exc:
+        #     new_solutions.append(
+        #         {
+        #             "prompt": prompt,
+        #             "error": str(exc),
+        #         }
+        #     )
 
     write_json(solutions_file, existing_solutions + new_solutions)
 
@@ -680,7 +699,7 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Generate normal rollouts without applying steering hooks.",
     )
-    parser.add_argument("-n", "--strength_n", type=float, default=1.0)
+    parser.add_argument("-n", "--strength_n", type=float, default=0.1)
     parser.add_argument("-nr", "--num_rollouts", type=int, default=100)
     parser.add_argument("-t", "--temperature", type=float, default=0.6)
     parser.add_argument("-tp", "--top_p", type=float, default=0.95)
