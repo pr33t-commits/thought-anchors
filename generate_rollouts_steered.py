@@ -43,7 +43,8 @@ DEFAULT_STEERING_VECTOR_PATH = (
     / "residual_stream_analysis"
     / "Results"
     / "linear_probes"
-    / "steering_vectors.json"
+    / "last_tokenvector"
+    / "linear_probe_results_test.json"
 )
 DEFAULT_SCALING_CSV = (
     SCRIPT_DIR
@@ -53,6 +54,8 @@ DEFAULT_SCALING_CSV = (
     / "tag_wise_scaling.csv"
 )
 STEERING_TAGS = ("plan_generation", "uncertainty_management", "fact_retrieval")
+DEFAULT_SELECTION_STRATEGY = "best_overall_f1"
+SUPPORTED_REGRESSOR_TYPE = "multinomial"
 
 
 class StreamingChunkContext:
@@ -198,7 +201,7 @@ class SteeringRule:
         self,
         steering_vectors_path: Path,
         scaling_csv_path: Path,
-        probe_type: Optional[str],
+        selection_strategy: str,
         strength_n: float,
         device: torch.device,
         dtype: torch.dtype,
@@ -207,7 +210,7 @@ class SteeringRule:
         self.strength_n = strength_n
         self.directions = self._load_directions(
             steering_vectors_path=steering_vectors_path,
-            probe_type=probe_type,
+            selection_strategy=selection_strategy,
             device=device,
             dtype=dtype,
         )
@@ -215,31 +218,48 @@ class SteeringRule:
     def _load_directions(
         self,
         steering_vectors_path: Path,
-        probe_type: Optional[str],
+        selection_strategy: str,
         device: torch.device,
         dtype: torch.dtype,
     ) -> Dict[str, Dict[int, torch.Tensor]]:
         with open(steering_vectors_path, "r", encoding="utf-8") as f:
             raw = json.load(f)
 
-        directions: Dict[str, Dict[int, torch.Tensor]] = {}
-        for tag in STEERING_TAGS:
-            if tag not in raw:
-                raise KeyError(f"Missing steering vector tag {tag!r} in {steering_vectors_path}")
-            probe_map = raw[tag]
-            if not isinstance(probe_map, dict) or not probe_map:
-                raise ValueError(f"Steering vectors for {tag!r} must be a non-empty dict")
-            selected_probe = probe_type or next(iter(probe_map))
-            if selected_probe not in probe_map:
-                raise KeyError(
-                    f"Probe type {selected_probe!r} not found for {tag!r}. "
-                    f"Available: {sorted(probe_map)}"
-                )
-            layer_map = probe_map[selected_probe]
-            directions[tag] = {
-                normalize_layer_key(layer): vector_to_tensor(vector, device=device, dtype=dtype)
-                for layer, vector in layer_map.items()
-            }
+        results = raw.get("results")
+        if not isinstance(results, dict):
+            raise ValueError(
+                f"{steering_vectors_path} must use the linear-probe result format with "
+                "a strategy-keyed 'results' object."
+            )
+        if selection_strategy not in results:
+            raise KeyError(
+                f"Selection strategy {selection_strategy!r} not found in {steering_vectors_path}. "
+                f"Available: {sorted(results)}"
+            )
+
+        strategy_records = results[selection_strategy]
+        if not isinstance(strategy_records, list):
+            raise ValueError(f"results[{selection_strategy!r}] must be a list of probe records.")
+
+        directions: Dict[str, Dict[int, torch.Tensor]] = {tag: {} for tag in STEERING_TAGS}
+        for record in strategy_records:
+            if record.get("regressor_type") != SUPPORTED_REGRESSOR_TYPE:
+                continue
+            layer = normalize_layer_key(record["layer"])
+            weights_by_class = record.get("weights_by_class", {})
+            if not isinstance(weights_by_class, dict):
+                continue
+            for tag in STEERING_TAGS:
+                if tag not in weights_by_class:
+                    continue
+                directions[tag][layer] = vector_to_tensor(weights_by_class[tag], device=device, dtype=dtype)
+
+        missing_tags = [tag for tag, layer_map in directions.items() if not layer_map]
+        if missing_tags:
+            raise KeyError(
+                f"No {SUPPORTED_REGRESSOR_TYPE!r} steering weights found for tags {missing_tags} "
+                f"under selection strategy {selection_strategy!r} in {steering_vectors_path}."
+            )
         return directions
 
     @property
@@ -570,7 +590,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output_dir", type=Path, default=DEFAULT_OUTPUT_DIR)
     parser.add_argument("--steering_vectors", type=Path, default=DEFAULT_STEERING_VECTOR_PATH)
     parser.add_argument("--scaling_csv", type=Path, default=DEFAULT_SCALING_CSV)
-    parser.add_argument("--probe_type", type=str, default=None)
+    parser.add_argument(
+        "--selection_strategy",
+        type=str,
+        default=DEFAULT_SELECTION_STRATEGY,
+        choices=["best_overall_f1", "best_overall_recall", "best_class_f1", "best_class_recall"],
+        help="Selection strategy key to read from linear_probe_results_test.json.",
+    )
     parser.add_argument("-n", "--strength_n", type=float, default=1.0)
     parser.add_argument("-nr", "--num_rollouts", type=int, default=100)
     parser.add_argument("-t", "--temperature", type=float, default=0.6)
@@ -607,7 +633,7 @@ def main() -> None:
     rule = SteeringRule(
         steering_vectors_path=args.steering_vectors,
         scaling_csv_path=args.scaling_csv,
-        probe_type=args.probe_type,
+        selection_strategy=args.selection_strategy,
         strength_n=args.strength_n,
         device=device,
         dtype=dtype,

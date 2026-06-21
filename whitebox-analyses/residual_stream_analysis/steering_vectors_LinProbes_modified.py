@@ -683,6 +683,150 @@ def build_selection_summary(results: List[Dict[str, Any]]) -> Dict[str, Any]:
     return summary
 
 
+def average_fold_coefficients(result: Dict[str, Any]) -> Dict[str, List[float]]:
+    coefficients_by_class: Dict[str, List[np.ndarray]] = defaultdict(list)
+
+    for fold in result.get("folds", []):
+        if fold.get("status") != "ok":
+            continue
+        for class_name, coefficient_info in fold.get("class_coefficients", {}).items():
+            coef = coefficient_info.get("coef")
+            if coef is None:
+                continue
+            coefficients_by_class[str(class_name)].append(np.asarray(coef, dtype=float))
+
+    return {
+        class_name: np.mean(class_coefficients, axis=0).tolist()
+        for class_name, class_coefficients in coefficients_by_class.items()
+        if class_coefficients
+    }
+
+
+def _layer_sort_key(layer: Any) -> Tuple[int, Any]:
+    layer_text = str(layer)
+    return (0, int(layer_text)) if layer_text.isdigit() else (1, layer_text)
+
+
+def _merge_weight_exports(
+    exports: Dict[Tuple[str, str, str], Dict[str, Any]],
+    *,
+    selection_strategy: str,
+    probe_type: str,
+    layer: str,
+    class_weights: Dict[str, List[float]],
+) -> None:
+    key = (selection_strategy, probe_type, str(layer))
+    export = exports.setdefault(
+        key,
+        {
+            "regressor_type": probe_type,
+            "layer": str(layer),
+            "selection_strategy": selection_strategy,
+            "classes": [],
+            "weights_by_class": {},
+        },
+    )
+
+    weights_by_class = export["weights_by_class"]
+    for class_name, weights in class_weights.items():
+        existing = weights_by_class.setdefault(class_name, [])
+        existing.append(np.asarray(weights, dtype=float))
+
+
+def _finalize_weight_exports(exports: Dict[Tuple[str, str, str], Dict[str, Any]]) -> Dict[str, List[Dict[str, Any]]]:
+    finalized_by_strategy: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
+    for export in exports.values():
+        averaged_weights = {
+            class_name: np.mean(weights, axis=0).tolist()
+            for class_name, weights in export["weights_by_class"].items()
+            if weights
+        }
+        finalized_by_strategy[export["selection_strategy"]].append(
+            {
+                "regressor_type": export["regressor_type"],
+                "layer": export["layer"],
+                "selection_strategy": export["selection_strategy"],
+                "classes": sorted(averaged_weights),
+                "weights_by_class": averaged_weights,
+            }
+        )
+
+    return {
+        selection_strategy: sorted(
+            strategy_exports,
+            key=lambda item: (item["regressor_type"], _layer_sort_key(item["layer"])),
+        )
+        for selection_strategy, strategy_exports in sorted(finalized_by_strategy.items())
+    }
+
+
+def count_weight_export_records(weight_exports: Dict[str, List[Dict[str, Any]]]) -> int:
+    return sum(len(strategy_exports) for strategy_exports in weight_exports.values())
+
+
+def build_weight_export_results(
+    results: List[Dict[str, Any]],
+    selection_summary: Dict[str, Any],
+) -> Dict[str, List[Dict[str, Any]]]:
+    ok_results = [result for result in results if result.get("status") == "ok"]
+    averaged_by_result = [
+        (result, average_fold_coefficients(result))
+        for result in ok_results
+    ]
+    exports: Dict[Tuple[str, str, str], Dict[str, Any]] = {}
+
+    overall_strategies = {
+        "best_overall_f1": ("overall", "best_f1"),
+        "best_overall_recall": ("overall", "best_recall"),
+    }
+    for export_strategy, (_, summary_key) in overall_strategies.items():
+        selected_probe_type = (
+            selection_summary.get("overall", {})
+            .get(summary_key, {})
+            .get("selected_probe_type")
+        )
+        if not selected_probe_type:
+            continue
+        for result, class_weights in averaged_by_result:
+            if result.get("probe_type") != selected_probe_type:
+                continue
+            _merge_weight_exports(
+                exports,
+                selection_strategy=export_strategy,
+                probe_type=selected_probe_type,
+                layer=str(result["layer"]),
+                class_weights=class_weights,
+            )
+
+    per_class_strategy_keys = {
+        "best_class_f1": "best_f1",
+        "best_class_recall": "best_recall",
+    }
+    per_class_summary = selection_summary.get("per_class", {})
+    for export_strategy, summary_key in per_class_strategy_keys.items():
+        selected_type_by_class = {
+            class_name: class_summary.get(summary_key, {}).get("selected_probe_type")
+            for class_name, class_summary in per_class_summary.items()
+        }
+        for result, class_weights in averaged_by_result:
+            selected_class_weights = {
+                class_name: weights
+                for class_name, weights in class_weights.items()
+                if selected_type_by_class.get(class_name) == result.get("probe_type")
+            }
+            if not selected_class_weights:
+                continue
+            _merge_weight_exports(
+                exports,
+                selection_strategy=export_strategy,
+                probe_type=str(result["probe_type"]),
+                layer=str(result["layer"]),
+                class_weights=selected_class_weights,
+            )
+
+    return _finalize_weight_exports(exports)
+
+
 def write_summary_csv(results: List[Dict[str, Any]], output_path: Path) -> None:
     step_start = time.perf_counter()
     fieldnames = [
@@ -825,6 +969,7 @@ def _run_for_vector_pool(
     print(f"probe timing: evaluate_all_probes_total[{vector_pool}]={time.perf_counter() - step_start:.2f}s", flush=True)
 
     selection_summary = build_selection_summary(all_results)
+    weight_export_results = build_weight_export_results(all_results, selection_summary)
 
     step_start = time.perf_counter()
     vector_output_dir = output_dir / vector_pool
@@ -844,7 +989,7 @@ def _run_for_vector_pool(
                     "probe_types": ["multinomial", "one_vs_rest"],
                 },
                 "selection_summary": selection_summary,
-                "results": all_results,
+                "results": weight_export_results,
             },
             f,
             indent=2,
@@ -869,7 +1014,7 @@ def _run_for_vector_pool(
         "vector_pool": vector_pool,
         "metadata": metadata,
         "selection_summary": selection_summary,
-        "results": all_results,
+        "num_weight_export_records": count_weight_export_records(weight_export_results),
         "detailed_path": str(detailed_path),
         "summary_path": str(summary_path),
         "selection_path": str(selection_path),
