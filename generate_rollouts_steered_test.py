@@ -345,7 +345,6 @@ class SteeringRule:
         decay = self.strength_n * math.exp(-chunk_idx_scaled)
         return decay * torch.stack(pieces, dim=0).sum(dim=0)
 
-
 def make_residual_steering_hook(
     layer_idx: int,
     rule: SteeringRule,
@@ -353,8 +352,9 @@ def make_residual_steering_hook(
     hook_call_counts: Dict[int, int],
     hook_seen_chunk_scales: Dict[int, List[float]],
 ):
-    print(f"In the hook function for layer : {layer_idx}, for chunk id : {context.chunk_idx_scaled}", flush = True)
+    # print(f"In the hook function for layer : {layer_idx}, for chunk id : {context.chunk_idx_scaled}", flush = True)
     def hook_fn(residual: torch.Tensor, hook) -> torch.Tensor:
+        print(f"In the hook function for layer : {layer_idx}, for chunk id : {context.chunk_idx_scaled}", flush = True)
         del hook
         hook_call_counts[layer_idx] = hook_call_counts.get(layer_idx, 0) + 1
         scale = float(context.chunk_idx_scaled)

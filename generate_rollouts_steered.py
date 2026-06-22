@@ -35,7 +35,7 @@ DEFAULT_STEERING_VECTOR_PATH = (
     / "residual_stream_analysis"
     / "Results"
     / "linear_probes"
-    / "last_tokenvector"
+    / "mean_vector"
     / "linear_probe_results_test.json"
 )
 DEFAULT_SCALING_CSV = (
@@ -47,25 +47,25 @@ DEFAULT_SCALING_CSV = (
 )
 HARDCODED_PROBLEM_IDS = [
     330,
-    1591,
-    2050,
-    2137,
-    2189,
-    2236,
-    2238,
-    2870,
-    3360,
-    3448,
-    3550,
-    3916,
-    3935,
-    4019,
-    4164,
-    4605,
-    4682,
-    6481,
-    6596,
-    6998,
+    # 1591,
+    # 2050,
+    # 2137,
+    # 2189,
+    # 2236,
+    # 2238,
+    # 2870,
+    # 3360,
+    # 3448,
+    # 3550,
+    # 3916,
+    # 3935,
+    # 4019,
+    # 4164,
+    # 4605,
+    # 4682,
+    # 6481,
+    # 6596,
+    # 6998,
 ]
 STEERING_TAGS = ("plan_generation", "uncertainty_management", "fact_retrieval")
 DEFAULT_SELECTION_STRATEGY = "best_overall_f1"
@@ -230,14 +230,6 @@ def vector_to_tensor(vector: Any, device: torch.device, dtype: torch.dtype) -> t
     return tensor.to(dtype=dtype)
 
 
-def sanitize_logits(logits: torch.Tensor) -> torch.Tensor:
-    """Clamp invalid values so sampling never sees NaN/Inf probabilities."""
-    logits = logits.float()
-    if not torch.isfinite(logits).all():
-        logits = torch.nan_to_num(logits, nan=-float("inf"), posinf=torch.finfo(logits.dtype).max, neginf=-float("inf"))
-    return logits
-
-
 class SteeringRule:
     def __init__(
         self,
@@ -375,7 +367,7 @@ def make_residual_steering_hook(
 
 
 def sample_next_token(logits: torch.Tensor, temperature: float, top_p: float, top_k: Optional[int]) -> torch.Tensor:
-    logits = sanitize_logits(logits)
+    logits = logits.float()
     if temperature <= 0:
         return torch.argmax(logits, dim=-1, keepdim=True)
     logits = logits / temperature
@@ -393,9 +385,37 @@ def sample_next_token(logits: torch.Tensor, temperature: float, top_p: float, to
         logits = torch.full_like(logits, -float("inf"))
         logits.scatter_(dim=-1, index=sorted_indices, src=sorted_logits)
     probs = torch.softmax(logits, dim=-1)
-    if not torch.isfinite(probs).all() or probs.sum(dim=-1).le(0).any():
-        return torch.argmax(logits, dim=-1, keepdim=True)
     return torch.multinomial(probs, num_samples=1)
+
+
+def has_complete_boxed_answer(text: str) -> bool:
+    """Return True once the text contains a fully closed \\boxed{...} answer."""
+    marker = r"\boxed{"
+    search_start = 0
+
+    while True:
+        start_idx = text.find(marker, search_start)
+        if start_idx == -1:
+            return False
+
+        idx = start_idx + len(marker)
+        brace_count = 1
+        answer_chars: List[str] = []
+
+        while idx < len(text) and brace_count > 0:
+            char = text[idx]
+            if char == "{":
+                brace_count += 1
+            elif char == "}":
+                brace_count -= 1
+                if brace_count == 0:
+                    return bool("".join(answer_chars).strip())
+
+            if brace_count > 0:
+                answer_chars.append(char)
+            idx += 1
+
+        search_start = start_idx + len(marker)
 
 
 def generate_steered(
@@ -430,22 +450,16 @@ def generate_steered(
             for layer_idx in rule.layers
         ]
     generated_ids: List[int] = []
-    eos_ids = {model.tokenizer.eos_token_id}
-    if getattr(model.tokenizer, "pad_token_id", None) is not None:
-        eos_ids.discard(model.tokenizer.pad_token_id)
     tokens = prompt_tokens
+    finish_reason = "length"
 
     with model.hooks(fwd_hooks=hook_specs):
         for _ in range(max_tokens):
             with torch.no_grad():
                 logits = model(tokens, return_type="logits")
             next_token = sample_next_token(logits[:, -1, :], temperature, top_p, top_k)
-            token_id = int(next_token[0, 0].item())
-            if token_id in eos_ids:
-                break
-
-            generated_ids.append(token_id)
-            token_text = model.tokenizer.decode([token_id], skip_special_tokens=True)
+            generated_ids.append(int(next_token[0, 0].item()))
+            token_text = model.tokenizer.decode(next_token[0].tolist(), skip_special_tokens=True)
             previous_chunk_count = context.num_chunks_generated
             context.feed(token_text)
             if context.num_chunks_generated > previous_chunk_count:
@@ -457,6 +471,9 @@ def generate_steered(
                     }
                 )
             tokens = torch.cat([tokens, next_token.to(tokens.device)], dim=1)
+            if has_complete_boxed_answer(context.generated_text):
+                finish_reason = "boxed_answer"
+                break
 
     if rule is not None and generated_ids:
         layers_without_calls = [layer_idx for layer_idx in rule.layers if hook_call_counts.get(layer_idx, 0) == 0]
@@ -489,7 +506,7 @@ def generate_steered(
     rollout_text = model.tokenizer.decode(generated_ids, skip_special_tokens=True)
     return {
         "text": rollout_text,
-        "finish_reason": "length" if len(generated_ids) >= max_tokens else "stop",
+        "finish_reason": finish_reason,
         "usage": {"completion_tokens": len(generated_ids), "total_tokens": prompt_len + len(generated_ids)},
         "chunk_context": context.snapshot(),
         "steering_debug": {
@@ -508,6 +525,7 @@ def generate_steered(
 def load_local_model(args: argparse.Namespace) -> Any:
     try:
         from transformer_lens import HookedTransformer
+        from transformer_lens.model_bridge import TransformerBridge
     except ImportError as exc:
         raise ImportError(
             "transformer_lens is required for generate_rollouts_steered.py. "
@@ -519,18 +537,28 @@ def load_local_model(args: argparse.Namespace) -> Any:
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
     dtype = torch.float16 if torch.cuda.is_available() else torch.float32
-    model = HookedTransformer.from_pretrained_no_processing(
-        args.model,
-        device=device,
+    # model = HookedTransformer.from_pretrained_no_processing(
+    #     args.model,
+    #     device=device,
+    #     dtype=dtype,
+    #     default_padding_side="left",
+    #     fold_ln=False,
+    #     center_writing_weights=False,
+    #     center_unembed=False,
+    #     refactor_factored_attn_matrices=False,
+    #     token=HF_KEY,
+    #     trust_remote_code=True,
+    # )
+    model = TransformerBridge.boot_transformers(args.model, 
+                                               device=device,
         dtype=dtype,
-        default_padding_side="left",
-        fold_ln=False,
-        center_writing_weights=False,
-        center_unembed=False,
-        refactor_factored_attn_matrices=False,
-        token=HF_KEY,
-        trust_remote_code=True,
-    )
+        # default_padding_side="left",
+        # fold_ln=False,
+        # center_writing_weights=False,
+        # center_unembed=False,
+        # refactor_factored_attn_matrices=False,
+        # token=HF_KEY,
+        trust_remote_code=True)
     model.eval()
     if model.tokenizer is not None and model.tokenizer.pad_token_id is None:
         model.tokenizer.pad_token_id = model.tokenizer.eos_token_id
@@ -611,40 +639,40 @@ def process_problem_dir(
     prompt = rollout_prompt(problem)
     new_solutions = []
     for _ in tqdm(range(needed), desc=f"problem_{problem_id} rollouts", leave=False):
-        try:
-            result = generate_steered(
-                model=model,
-                prompt=prompt,
-                rule=rule,
-                max_tokens=args.max_tokens,
-                temperature=args.temperature,
-                top_p=args.top_p,
-                top_k=args.top_k,
-            )
-            rollout_text = result["text"]
-            extracted_answers = extract_boxed_answers(rollout_text)
-            answer = extracted_answers[0] if extracted_answers else ""
-            is_correct = bool(problem.get("gt_answer") and answer and check_answer(answer, problem["gt_answer"]))
+        # try:
+        result = generate_steered(
+            model=model,
+            prompt=prompt,
+            rule=rule,
+            max_tokens=args.max_tokens,
+            temperature=args.temperature,
+            top_p=args.top_p,
+            top_k=args.top_k,
+        )
+        rollout_text = result["text"]
+        extracted_answers = extract_boxed_answers(rollout_text)
+        answer = extracted_answers[0] if extracted_answers else ""
+        is_correct = bool(problem.get("gt_answer") and answer and check_answer(answer, problem["gt_answer"]))
 
-            new_solutions.append(
-                {
-                    "prompt": prompt,
-                    "rollout": rollout_text,
-                    "full_cot": f"{prompt}{rollout_text}",
-                    "answer": answer,
-                    "is_correct": is_correct,
-                    "steered_chunks": result["chunk_context"]["chunks"],
-                    "chunk_context": result["chunk_context"],
-                    "steering_debug": result["steering_debug"],
-                }
-            )
-        except Exception as exc:
-            new_solutions.append(
-                {
-                    "prompt": prompt,
-                    "error": str(exc),
-                }
-            )
+        new_solutions.append(
+            {
+                "prompt": prompt,
+                "rollout": rollout_text,
+                "full_cot": f"{prompt}{rollout_text}",
+                "answer": answer,
+                "is_correct": is_correct,
+                "steered_chunks": result["chunk_context"]["chunks"],
+                "chunk_context": result["chunk_context"],
+                "steering_debug": result["steering_debug"],
+            }
+        )
+        # except Exception as exc:
+        #     new_solutions.append(
+        #         {
+        #             "prompt": prompt,
+        #             "error": str(exc),
+        #         }
+        #     )
 
     write_json(solutions_file, existing_solutions + new_solutions)
 
