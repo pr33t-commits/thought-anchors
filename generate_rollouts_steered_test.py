@@ -357,7 +357,9 @@ def make_residual_steering_hook(
     hook_call_counts: Dict[int, int],
     hook_seen_chunk_scales: Dict[int, List[float]],
 ):
+    
     def hook_fn(residual: torch.Tensor, hook) -> torch.Tensor:
+        
         del hook
         hook_call_counts[layer_idx] = hook_call_counts.get(layer_idx, 0) + 1
         scale = float(context.chunk_idx_scaled)
@@ -389,6 +391,7 @@ def make_batched_residual_steering_hook(
 ):
     def hook_fn(residual: torch.Tensor, hook) -> torch.Tensor:
         del hook
+        
         if residual.shape[0] != len(states):
             raise ValueError(
                 f"Hook batch size {residual.shape[0]} does not match active rollout count {len(states)}."
@@ -524,9 +527,35 @@ def build_rollout_result(
                 str(layer): scales for layer, scales in sorted(state.hook_seen_chunk_scales.items())
             },
             "chunk_transitions": chunk_transition_verification,
-            "use_past_kv_cache": False,
+            "use_past_kv_cache": True,
         },
     }
+
+
+def update_rollout_state(
+    state: RolloutState,
+    token_id: int,
+    tokenizer: Any,
+    batch_idx: int,
+) -> None:
+    state.generated_ids.append(int(token_id))
+    token_text = tokenizer.decode([token_id], skip_special_tokens=True)
+    previous_chunk_count = state.context.num_chunks_generated
+    state.context.feed(token_text)
+    if state.context.num_chunks_generated > previous_chunk_count:
+        if state.context.num_chunks_generated % 10 == 0:
+            print(f"Batch :- {batch_idx}, chunk number :- {state.context.num_chunks_generated}")
+            print(state.context.generated_text[max(-len(state.context.generated_text), -100):])
+        state.chunk_transitions.append(
+            {
+                "completion_tokens_after_feed": len(state.generated_ids),
+                "num_chunks_generated": state.context.num_chunks_generated,
+                "chunk_idx_scaled": float(state.context.chunk_idx_scaled),
+            }
+        )
+    if has_complete_boxed_answer(state.context.generated_text):
+        state.finish_reason = "boxed_answer"
+        state.is_finished = True
 
 
 def generate_steered_batch(
@@ -565,65 +594,73 @@ def generate_steered_batch(
         for idx in range(batch_size)
     ]
 
-    with torch.inference_mode():
-        for _ in range(max_tokens):
-            active_states = [state for state in states if not state.is_finished]
-            if not active_states:
-                break
+    hook_specs = []
+    if rule is not None:
+        hook_specs = [
+            (
+                f"blocks.{layer_idx}.hook_resid_post",
+                make_batched_residual_steering_hook(layer_idx, rule, states),
+            )
+            for layer_idx in rule.layers
+        ]
 
-            active_lengths = {int(state.input_ids.shape[0]) for state in active_states}
-            if len(active_lengths) != 1:
-                raise ValueError(
-                    "Active rollout lengths diverged inside a batch. "
-                    "Replicated prompts should stay aligned after dropping finished rollouts."
-                )
-
-            active_input_ids = torch.stack([state.input_ids for state in active_states], dim=0)
-            hook_specs = []
-            if rule is not None:
-                hook_specs = [
-                    (
-                        f"blocks.{layer_idx}.hook_resid_post",
-                        make_batched_residual_steering_hook(layer_idx, rule, active_states),
+    with model.hooks(fwd_hooks=hook_specs):
+        stream_temperature = temperature if temperature > 0 else 1.0
+        token_stream = model.generate_stream(
+            input=prompt_batch,
+            max_new_tokens=max_tokens,
+            max_tokens_per_yield=1,
+            stop_at_eos=False,
+            do_sample=temperature > 0,
+            top_k=top_k,
+            top_p=top_p,
+            temperature=stream_temperature,
+            use_past_kv_cache=True,
+            return_type="tokens",
+            verbose=False,
+        )
+        first_yield = True
+        try:
+            for yielded_tokens in token_stream:
+                if not isinstance(yielded_tokens, torch.Tensor):
+                    raise TypeError(
+                        "TransformerBridge.generate_stream(return_type='tokens') must yield torch.Tensor values."
                     )
-                    for layer_idx in rule.layers
-                ]
-
-            with model.hooks(fwd_hooks=hook_specs):
-                logits = model(active_input_ids, return_type="logits")
-
-            if not isinstance(logits, torch.Tensor):
-                raise TypeError("Model forward pass must return torch.Tensor logits.")
-            if logits.ndim != 3:
-                raise ValueError(f"Expected logits to have shape [batch, pos, vocab], got {tuple(logits.shape)}")
-
-            next_tokens = sample_next_token(
-                logits=logits[:, -1, :],
-                temperature=temperature,
-                top_p=top_p,
-                top_k=top_k,
-            ).squeeze(-1)
-
-            for batch_idx, state in enumerate(active_states):
-                next_token = next_tokens[batch_idx : batch_idx + 1].to(device=state.input_ids.device)
-                token_id = int(next_token.item())
-                state.generated_ids.append(token_id)
-                state.input_ids = torch.cat((state.input_ids, next_token), dim=0)
-
-                token_text = model.tokenizer.decode([token_id], skip_special_tokens=True)
-                previous_chunk_count = state.context.num_chunks_generated
-                state.context.feed(token_text)
-                if state.context.num_chunks_generated > previous_chunk_count:
-                    state.chunk_transitions.append(
-                        {
-                            "completion_tokens_after_feed": len(state.generated_ids),
-                            "num_chunks_generated": state.context.num_chunks_generated,
-                            "chunk_idx_scaled": float(state.context.chunk_idx_scaled),
-                        }
+                if yielded_tokens.ndim == 1:
+                    yielded_tokens = yielded_tokens.unsqueeze(0)
+                if yielded_tokens.shape[0] != batch_size:
+                    raise ValueError(
+                        f"Expected streamed batch size {batch_size}, got {yielded_tokens.shape[0]}"
                     )
-                if has_complete_boxed_answer(state.context.generated_text):
-                    state.finish_reason = "boxed_answer"
-                    state.is_finished = True
+
+                streamed_token_rows = yielded_tokens.tolist()
+                if first_yield:
+                    first_yield = False
+                    if yielded_tokens.shape[1] >= prompt_len:
+                        streamed_token_rows = [row[prompt_len:] for row in streamed_token_rows]
+                    else:
+                        continue
+
+                any_active = False
+                for batch_idx, state in enumerate(states):
+                    if state.is_finished:
+                        continue
+                    any_active = True
+                    for token_id in streamed_token_rows[batch_idx]:
+                        update_rollout_state(
+                            state=state,
+                            token_id=int(token_id),
+                            tokenizer=model.tokenizer,
+                            batch_idx=batch_idx,
+                        )
+                        if state.is_finished or len(state.generated_ids) >= max_tokens:
+                            break
+                if not any_active or all(state.is_finished or len(state.generated_ids) >= max_tokens for state in states):
+                    break
+        finally:
+            close_stream = getattr(token_stream, "close", None)
+            if callable(close_stream):
+                close_stream()
 
     return [build_rollout_result(model=model, state=state, rule=rule) for state in states]
 
