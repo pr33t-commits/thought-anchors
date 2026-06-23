@@ -450,30 +450,68 @@ def generate_steered(
             for layer_idx in rule.layers
         ]
     generated_ids: List[int] = []
-    tokens = prompt_tokens
     finish_reason = "length"
+    stop_generation = False
 
     with model.hooks(fwd_hooks=hook_specs):
-        for _ in range(max_tokens):
-            with torch.no_grad():
-                logits = model(tokens, return_type="logits")
-            next_token = sample_next_token(logits[:, -1, :], temperature, top_p, top_k)
-            generated_ids.append(int(next_token[0, 0].item()))
-            token_text = model.tokenizer.decode(next_token[0].tolist(), skip_special_tokens=True)
-            previous_chunk_count = context.num_chunks_generated
-            context.feed(token_text)
-            if context.num_chunks_generated > previous_chunk_count:
-                chunk_transitions.append(
-                    {
-                        "completion_tokens_after_feed": len(generated_ids),
-                        "num_chunks_generated": context.num_chunks_generated,
-                        "chunk_idx_scaled": float(context.chunk_idx_scaled),
-                    }
-                )
-            tokens = torch.cat([tokens, next_token.to(tokens.device)], dim=1)
-            if has_complete_boxed_answer(context.generated_text):
-                finish_reason = "boxed_answer"
-                break
+        # Cached decoding preserves the steered KV state from each generated token
+        # so later tokens are conditioned on the modified activations.
+        stream_temperature = temperature if temperature > 0 else 1.0
+        token_stream = model.generate_stream(
+            input=prompt_tokens,
+            max_new_tokens=max_tokens,
+            max_tokens_per_yield=1,
+            stop_at_eos=False,
+            do_sample=temperature > 0,
+            top_k=top_k,
+            top_p=top_p,
+            temperature=stream_temperature,
+            use_past_kv_cache=True,
+            return_type="tokens",
+            verbose=False,
+        )
+        first_yield = True
+        try:
+            for yielded_tokens in token_stream:
+                if not isinstance(yielded_tokens, torch.Tensor):
+                    raise TypeError(
+                        "TransformerBridge.generate_stream(return_type='tokens') must yield torch.Tensor values."
+                    )
+                if yielded_tokens.ndim == 1:
+                    yielded_tokens = yielded_tokens.unsqueeze(0)
+
+                streamed_token_ids = yielded_tokens[0].tolist()
+                if first_yield:
+                    first_yield = False
+                    if len(streamed_token_ids) >= prompt_len:
+                        streamed_token_ids = streamed_token_ids[prompt_len:]
+                    else:
+                        continue
+
+                for token_id in streamed_token_ids:
+                    generated_ids.append(int(token_id))
+                    token_text = model.tokenizer.decode([token_id], skip_special_tokens=True)
+                    previous_chunk_count = context.num_chunks_generated
+                    context.feed(token_text)
+                    if context.num_chunks_generated > previous_chunk_count:
+                        chunk_transitions.append(
+                            {
+                                "completion_tokens_after_feed": len(generated_ids),
+                                "num_chunks_generated": context.num_chunks_generated,
+                                "chunk_idx_scaled": float(context.chunk_idx_scaled),
+                            }
+                        )
+                    if has_complete_boxed_answer(context.generated_text):
+                        finish_reason = "boxed_answer"
+                        stop_generation = True
+                        break
+
+                if stop_generation or len(generated_ids) >= max_tokens:
+                    break
+        finally:
+            close_stream = getattr(token_stream, "close", None)
+            if callable(close_stream):
+                close_stream()
 
     if rule is not None and generated_ids:
         layers_without_calls = [layer_idx for layer_idx in rule.layers if hook_call_counts.get(layer_idx, 0) == 0]
@@ -517,7 +555,7 @@ def generate_steered(
                 str(layer): scales for layer, scales in sorted(hook_seen_chunk_scales.items())
             },
             "chunk_transitions": chunk_transition_verification,
-            "use_past_kv_cache": False,
+            "use_past_kv_cache": True,
         },
     }
 
@@ -640,6 +678,7 @@ def process_problem_dir(
     new_solutions = []
     for _ in tqdm(range(needed), desc=f"problem_{problem_id} rollouts", leave=False):
         # try:
+        
         result = generate_steered(
             model=model,
             prompt=prompt,
@@ -708,7 +747,7 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Generate normal rollouts without applying steering hooks.",
     )
-    parser.add_argument("-n", "--strength_n", type=float, default=1.0)
+    parser.add_argument("-n", "--strength_n", type=float, default=3.0)
     parser.add_argument("-nr", "--num_rollouts", type=int, default=100)
     parser.add_argument("-t", "--temperature", type=float, default=0.6)
     parser.add_argument("-tp", "--top_p", type=float, default=0.95)

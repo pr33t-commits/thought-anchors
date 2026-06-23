@@ -181,7 +181,6 @@ class TagWiseScaling:
                     x = float(row["chunk_idx_scaled"])
                     y = float(row["counterfactual_importance_kl"])
                 except (KeyError, TypeError, ValueError):
-                    print(f'Failing here :- reading inter-tag scaling ratio', flush = True)
                     continue
                 rows_by_x.setdefault(x, {})[tag] = max(y, 0.0)
 
@@ -229,14 +228,6 @@ def vector_to_tensor(vector: Any, device: torch.device, dtype: torch.dtype) -> t
     if tensor.ndim > 1:
         tensor = tensor.reshape(-1, tensor.shape[-1])[-1]
     return tensor.to(dtype=dtype)
-
-
-def sanitize_logits(logits: torch.Tensor) -> torch.Tensor:
-    """Clamp invalid values so sampling never sees NaN/Inf probabilities."""
-    logits = logits.float()
-    if not torch.isfinite(logits).all():
-        logits = torch.nan_to_num(logits, nan=-float("inf"), posinf=torch.finfo(logits.dtype).max, neginf=-float("inf"))
-    return logits
 
 
 class SteeringRule:
@@ -302,10 +293,8 @@ class SteeringRule:
             for tag in STEERING_TAGS:
                 if tag not in weights_by_class:
                     continue
-                
                 directions[tag][layer] = vector_to_tensor(weights_by_class[tag][:1536], 
-                                                          device=device, 
-                                                          dtype=dtype)
+                                                          device=device, dtype=dtype)
 
         if requested_layer_set is not None:
             available_layers = set()
@@ -345,6 +334,7 @@ class SteeringRule:
         decay = self.strength_n * math.exp(-chunk_idx_scaled)
         return decay * torch.stack(pieces, dim=0).sum(dim=0)
 
+
 def make_residual_steering_hook(
     layer_idx: int,
     rule: SteeringRule,
@@ -352,9 +342,7 @@ def make_residual_steering_hook(
     hook_call_counts: Dict[int, int],
     hook_seen_chunk_scales: Dict[int, List[float]],
 ):
-    # print(f"In the hook function for layer : {layer_idx}, for chunk id : {context.chunk_idx_scaled}", flush = True)
     def hook_fn(residual: torch.Tensor, hook) -> torch.Tensor:
-        print(f"In the hook function for layer : {layer_idx}, for chunk id : {context.chunk_idx_scaled}", flush = True)
         del hook
         hook_call_counts[layer_idx] = hook_call_counts.get(layer_idx, 0) + 1
         scale = float(context.chunk_idx_scaled)
@@ -380,7 +368,7 @@ def make_residual_steering_hook(
 
 
 def sample_next_token(logits: torch.Tensor, temperature: float, top_p: float, top_k: Optional[int]) -> torch.Tensor:
-    logits = sanitize_logits(logits)
+    logits = logits.float()
     if temperature <= 0:
         return torch.argmax(logits, dim=-1, keepdim=True)
     logits = logits / temperature
@@ -398,9 +386,37 @@ def sample_next_token(logits: torch.Tensor, temperature: float, top_p: float, to
         logits = torch.full_like(logits, -float("inf"))
         logits.scatter_(dim=-1, index=sorted_indices, src=sorted_logits)
     probs = torch.softmax(logits, dim=-1)
-    if not torch.isfinite(probs).all() or probs.sum(dim=-1).le(0).any():
-        return torch.argmax(logits, dim=-1, keepdim=True)
     return torch.multinomial(probs, num_samples=1)
+
+
+def has_complete_boxed_answer(text: str) -> bool:
+    """Return True once the text contains a fully closed \\boxed{...} answer."""
+    marker = r"\boxed{"
+    search_start = 0
+
+    while True:
+        start_idx = text.find(marker, search_start)
+        if start_idx == -1:
+            return False
+
+        idx = start_idx + len(marker)
+        brace_count = 1
+        answer_chars: List[str] = []
+
+        while idx < len(text) and brace_count > 0:
+            char = text[idx]
+            if char == "{":
+                brace_count += 1
+            elif char == "}":
+                brace_count -= 1
+                if brace_count == 0:
+                    return bool("".join(answer_chars).strip())
+
+            if brace_count > 0:
+                answer_chars.append(char)
+            idx += 1
+
+        search_start = start_idx + len(marker)
 
 
 def generate_steered(
@@ -435,36 +451,68 @@ def generate_steered(
             for layer_idx in rule.layers
         ]
     generated_ids: List[int] = []
-    eos_ids = {model.tokenizer.eos_token_id}
-    if getattr(model.tokenizer, "pad_token_id", None) is not None:
-        eos_ids.discard(model.tokenizer.pad_token_id)
-    tokens = prompt_tokens
+    finish_reason = "length"
+    stop_generation = False
 
     with model.hooks(fwd_hooks=hook_specs):
-        for i in range(max_tokens):
-            print(f"Generating token number {i + 1}", flush = True)
-            with torch.no_grad():
-                logits = model(tokens, return_type="logits")
-            # import pandas as pd
-            # print(f"Logit distribution :- {pd.Series(logits[0,-1,:]).describe()}",flush = True)
-            next_token = sample_next_token(logits[:, -1, :], temperature, top_p, top_k)
-            token_id = int(next_token[0, 0].item())
-            if token_id in eos_ids:
-                break
+        # Cached decoding preserves the steered KV state from each generated token
+        # so later tokens are conditioned on the modified activations.
+        stream_temperature = temperature if temperature > 0 else 1.0
+        token_stream = model.generate_stream(
+            input=prompt_tokens,
+            max_new_tokens=max_tokens,
+            max_tokens_per_yield=1,
+            stop_at_eos=False,
+            do_sample=temperature > 0,
+            top_k=top_k,
+            top_p=top_p,
+            temperature=stream_temperature,
+            use_past_kv_cache=True,
+            return_type="tokens",
+            verbose=False,
+        )
+        first_yield = True
+        try:
+            for yielded_tokens in token_stream:
+                if not isinstance(yielded_tokens, torch.Tensor):
+                    raise TypeError(
+                        "TransformerBridge.generate_stream(return_type='tokens') must yield torch.Tensor values."
+                    )
+                if yielded_tokens.ndim == 1:
+                    yielded_tokens = yielded_tokens.unsqueeze(0)
 
-            generated_ids.append(token_id)
-            token_text = model.tokenizer.decode([token_id], skip_special_tokens=True)
-            previous_chunk_count = context.num_chunks_generated
-            context.feed(token_text)
-            if context.num_chunks_generated > previous_chunk_count:
-                chunk_transitions.append(
-                    {
-                        "completion_tokens_after_feed": len(generated_ids),
-                        "num_chunks_generated": context.num_chunks_generated,
-                        "chunk_idx_scaled": float(context.chunk_idx_scaled),
-                    }
-                )
-            tokens = torch.cat([tokens, next_token.to(tokens.device)], dim=1)
+                streamed_token_ids = yielded_tokens[0].tolist()
+                if first_yield:
+                    first_yield = False
+                    if len(streamed_token_ids) >= prompt_len:
+                        streamed_token_ids = streamed_token_ids[prompt_len:]
+                    else:
+                        continue
+
+                for token_id in streamed_token_ids:
+                    generated_ids.append(int(token_id))
+                    token_text = model.tokenizer.decode([token_id], skip_special_tokens=True)
+                    previous_chunk_count = context.num_chunks_generated
+                    context.feed(token_text)
+                    if context.num_chunks_generated > previous_chunk_count:
+                        chunk_transitions.append(
+                            {
+                                "completion_tokens_after_feed": len(generated_ids),
+                                "num_chunks_generated": context.num_chunks_generated,
+                                "chunk_idx_scaled": float(context.chunk_idx_scaled),
+                            }
+                        )
+                    if has_complete_boxed_answer(context.generated_text):
+                        finish_reason = "boxed_answer"
+                        stop_generation = True
+                        break
+
+                if stop_generation or len(generated_ids) >= max_tokens:
+                    break
+        finally:
+            close_stream = getattr(token_stream, "close", None)
+            if callable(close_stream):
+                close_stream()
 
     if rule is not None and generated_ids:
         layers_without_calls = [layer_idx for layer_idx in rule.layers if hook_call_counts.get(layer_idx, 0) == 0]
@@ -497,7 +545,7 @@ def generate_steered(
     rollout_text = model.tokenizer.decode(generated_ids, skip_special_tokens=True)
     return {
         "text": rollout_text,
-        "finish_reason": "length" if len(generated_ids) >= max_tokens else "stop",
+        "finish_reason": finish_reason,
         "usage": {"completion_tokens": len(generated_ids), "total_tokens": prompt_len + len(generated_ids)},
         "chunk_context": context.snapshot(),
         "steering_debug": {
@@ -508,7 +556,7 @@ def generate_steered(
                 str(layer): scales for layer, scales in sorted(hook_seen_chunk_scales.items())
             },
             "chunk_transitions": chunk_transition_verification,
-            "use_past_kv_cache": False,
+            "use_past_kv_cache": True,
         },
     }
 
@@ -631,6 +679,7 @@ def process_problem_dir(
     new_solutions = []
     for _ in tqdm(range(needed), desc=f"problem_{problem_id} rollouts", leave=False):
         # try:
+        
         result = generate_steered(
             model=model,
             prompt=prompt,
@@ -699,7 +748,7 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Generate normal rollouts without applying steering hooks.",
     )
-    parser.add_argument("-n", "--strength_n", type=float, default=0.1)
+    parser.add_argument("-n", "--strength_n", type=float, default=3.0)
     parser.add_argument("-nr", "--num_rollouts", type=int, default=100)
     parser.add_argument("-t", "--temperature", type=float, default=0.6)
     parser.add_argument("-tp", "--top_p", type=float, default=0.95)
