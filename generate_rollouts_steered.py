@@ -1,5 +1,6 @@
 import argparse
 import csv
+from dataclasses import dataclass, field
 import json
 import math
 import os
@@ -150,6 +151,20 @@ class StreamingChunkContext:
         }
 
 
+@dataclass
+class RolloutState:
+    prompt: str
+    prompt_len: int
+    input_ids: torch.Tensor
+    context: StreamingChunkContext = field(default_factory=StreamingChunkContext)
+    generated_ids: List[int] = field(default_factory=list)
+    finish_reason: str = "length"
+    hook_call_counts: Dict[int, int] = field(default_factory=dict)
+    hook_seen_chunk_scales: Dict[int, List[float]] = field(default_factory=dict)
+    chunk_transitions: List[Dict[str, Any]] = field(default_factory=list)
+    is_finished: bool = False
+
+
 def char_is_boundary_space(char: str) -> bool:
     return char == " " or char == "\n"
 
@@ -293,7 +308,8 @@ class SteeringRule:
             for tag in STEERING_TAGS:
                 if tag not in weights_by_class:
                     continue
-                directions[tag][layer] = vector_to_tensor(weights_by_class[tag], device=device, dtype=dtype)
+                directions[tag][layer] = vector_to_tensor(weights_by_class[tag], 
+                                                          device=device, dtype=dtype)
 
         if requested_layer_set is not None:
             available_layers = set()
@@ -366,6 +382,46 @@ def make_residual_steering_hook(
     return hook_fn
 
 
+def make_batched_residual_steering_hook(
+    layer_idx: int,
+    rule: SteeringRule,
+    states: Sequence[RolloutState],
+):
+    def hook_fn(residual: torch.Tensor, hook) -> torch.Tensor:
+        del hook
+        if residual.shape[0] != len(states):
+            raise ValueError(
+                f"Hook batch size {residual.shape[0]} does not match active rollout count {len(states)}."
+            )
+
+        vectors = []
+        for state in states:
+            state.hook_call_counts[layer_idx] = state.hook_call_counts.get(layer_idx, 0) + 1
+            scale = float(state.context.chunk_idx_scaled)
+            scales_for_layer = state.hook_seen_chunk_scales.setdefault(layer_idx, [])
+            if not scales_for_layer or not math.isclose(scales_for_layer[-1], scale, rel_tol=0.0, abs_tol=1e-12):
+                scales_for_layer.append(scale)
+
+            vector = rule.vector_for_layer(layer_idx, state.context.chunk_idx_scaled)
+            if vector is None:
+                vector = torch.zeros(residual.shape[-1], device=residual.device, dtype=residual.dtype)
+            else:
+                vector = vector.to(device=residual.device, dtype=residual.dtype)
+
+            if vector.numel() != residual.shape[-1]:
+                raise ValueError(
+                    f"Steering vector dim {vector.numel()} does not match hidden dim "
+                    f"{residual.shape[-1]} at layer {layer_idx}"
+                )
+            vectors.append(vector)
+
+        updated = residual.clone()
+        updated[:, -1, :] = updated[:, -1, :] + torch.stack(vectors, dim=0)
+        return updated
+
+    return hook_fn
+
+
 def sample_next_token(logits: torch.Tensor, temperature: float, top_p: float, top_k: Optional[int]) -> torch.Tensor:
     logits = logits.float()
     if temperature <= 0:
@@ -418,118 +474,28 @@ def has_complete_boxed_answer(text: str) -> bool:
         search_start = start_idx + len(marker)
 
 
-def generate_steered(
+def build_rollout_result(
     model: Any,
-    prompt: str,
+    state: RolloutState,
     rule: Optional[SteeringRule],
-    max_tokens: int,
-    temperature: float,
-    top_p: float,
-    top_k: Optional[int],
 ) -> Dict[str, Any]:
-    context = StreamingChunkContext()
-    prompt_tokens = model.to_tokens(prompt)
-    prompt_len = int(prompt_tokens.shape[1])
-    hook_call_counts: Dict[int, int] = {}
-    hook_seen_chunk_scales: Dict[int, List[float]] = {}
-    chunk_transitions: List[Dict[str, Any]] = []
-
-    hook_specs = []
-    if rule is not None:
-        hook_specs = [
-            (
-                f"blocks.{layer_idx}.hook_resid_post",
-                make_residual_steering_hook(
-                    layer_idx,
-                    rule,
-                    context,
-                    hook_call_counts,
-                    hook_seen_chunk_scales,
-                ),
-            )
-            for layer_idx in rule.layers
-        ]
-    generated_ids: List[int] = []
-    finish_reason = "length"
-    stop_generation = False
-
-    with model.hooks(fwd_hooks=hook_specs):
-        # Cached decoding preserves the steered KV state from each generated token
-        # so later tokens are conditioned on the modified activations.
-        stream_temperature = temperature if temperature > 0 else 1.0
-        token_stream = model.generate_stream(
-            input=prompt_tokens,
-            max_new_tokens=max_tokens,
-            max_tokens_per_yield=1,
-            stop_at_eos=False,
-            do_sample=temperature > 0,
-            top_k=top_k,
-            top_p=top_p,
-            temperature=stream_temperature,
-            use_past_kv_cache=True,
-            return_type="tokens",
-            verbose=False,
-        )
-        first_yield = True
-        try:
-            for yielded_tokens in token_stream:
-                if not isinstance(yielded_tokens, torch.Tensor):
-                    raise TypeError(
-                        "TransformerBridge.generate_stream(return_type='tokens') must yield torch.Tensor values."
-                    )
-                if yielded_tokens.ndim == 1:
-                    yielded_tokens = yielded_tokens.unsqueeze(0)
-
-                streamed_token_ids = yielded_tokens[0].tolist()
-                if first_yield:
-                    first_yield = False
-                    if len(streamed_token_ids) >= prompt_len:
-                        streamed_token_ids = streamed_token_ids[prompt_len:]
-                    else:
-                        continue
-
-                for token_id in streamed_token_ids:
-                    generated_ids.append(int(token_id))
-                    token_text = model.tokenizer.decode([token_id], skip_special_tokens=True)
-                    previous_chunk_count = context.num_chunks_generated
-                    context.feed(token_text)
-                    if context.num_chunks_generated > previous_chunk_count:
-                        chunk_transitions.append(
-                            {
-                                "completion_tokens_after_feed": len(generated_ids),
-                                "num_chunks_generated": context.num_chunks_generated,
-                                "chunk_idx_scaled": float(context.chunk_idx_scaled),
-                            }
-                        )
-                    if has_complete_boxed_answer(context.generated_text):
-                        finish_reason = "boxed_answer"
-                        stop_generation = True
-                        break
-
-                if stop_generation or len(generated_ids) >= max_tokens:
-                    break
-        finally:
-            close_stream = getattr(token_stream, "close", None)
-            if callable(close_stream):
-                close_stream()
-
-    if rule is not None and generated_ids:
-        layers_without_calls = [layer_idx for layer_idx in rule.layers if hook_call_counts.get(layer_idx, 0) == 0]
+    if rule is not None and state.generated_ids:
+        layers_without_calls = [layer_idx for layer_idx in rule.layers if state.hook_call_counts.get(layer_idx, 0) == 0]
         if layers_without_calls:
             raise RuntimeError(
                 f"Steering hooks were registered but never invoked for layers {layers_without_calls}."
             )
 
     chunk_transition_verification = []
-    for event in chunk_transitions:
-        should_affect_future_tokens = event["completion_tokens_after_feed"] < len(generated_ids)
+    for event in state.chunk_transitions:
+        should_affect_future_tokens = event["completion_tokens_after_feed"] < len(state.generated_ids)
         if rule is None or not should_affect_future_tokens:
             verification_passed = True
         else:
             verification_passed = all(
                 any(
                     math.isclose(scale, event["chunk_idx_scaled"], rel_tol=0.0, abs_tol=1e-12)
-                    for scale in hook_seen_chunk_scales.get(layer_idx, [])
+                    for scale in state.hook_seen_chunk_scales.get(layer_idx, [])
                 )
                 for layer_idx in rule.layers
             )
@@ -541,23 +507,147 @@ def generate_steered(
             }
         )
 
-    rollout_text = model.tokenizer.decode(generated_ids, skip_special_tokens=True)
+    rollout_text = model.tokenizer.decode(state.generated_ids, skip_special_tokens=True)
     return {
         "text": rollout_text,
-        "finish_reason": finish_reason,
-        "usage": {"completion_tokens": len(generated_ids), "total_tokens": prompt_len + len(generated_ids)},
-        "chunk_context": context.snapshot(),
+        "finish_reason": state.finish_reason,
+        "usage": {
+            "completion_tokens": len(state.generated_ids),
+            "total_tokens": state.prompt_len + len(state.generated_ids),
+        },
+        "chunk_context": state.context.snapshot(),
         "steering_debug": {
             "enabled": rule is not None,
             "hook_layers": [] if rule is None else list(rule.layers),
-            "hook_call_counts": {str(layer): count for layer, count in sorted(hook_call_counts.items())},
+            "hook_call_counts": {str(layer): count for layer, count in sorted(state.hook_call_counts.items())},
             "hook_seen_chunk_scales": {
-                str(layer): scales for layer, scales in sorted(hook_seen_chunk_scales.items())
+                str(layer): scales for layer, scales in sorted(state.hook_seen_chunk_scales.items())
             },
             "chunk_transitions": chunk_transition_verification,
-            "use_past_kv_cache": True,
+            "use_past_kv_cache": False,
         },
     }
+
+
+def generate_steered_batch(
+    model: Any,
+    prompt: str,
+    prompt_tokens: torch.Tensor,
+    batch_size: int,
+    rule: Optional[SteeringRule],
+    max_tokens: int,
+    temperature: float,
+    top_p: float,
+    top_k: Optional[int],
+) -> List[Dict[str, Any]]:
+    if batch_size <= 0:
+        return []
+
+    if prompt_tokens.ndim != 2:
+        raise ValueError(f"Expected prompt_tokens to be rank-2, got shape {tuple(prompt_tokens.shape)}")
+
+    if prompt_tokens.shape[0] == 1:
+        prompt_batch = prompt_tokens.repeat(batch_size, 1)
+    elif prompt_tokens.shape[0] == batch_size:
+        prompt_batch = prompt_tokens
+    else:
+        raise ValueError(
+            f"prompt_tokens batch dimension must be 1 or batch_size={batch_size}, got {prompt_tokens.shape[0]}"
+        )
+
+    prompt_len = int(prompt_batch.shape[1])
+    states = [
+        RolloutState(
+            prompt=prompt,
+            prompt_len=prompt_len,
+            input_ids=prompt_batch[idx].clone(),
+        )
+        for idx in range(batch_size)
+    ]
+
+    with torch.inference_mode():
+        for _ in range(max_tokens):
+            active_states = [state for state in states if not state.is_finished]
+            if not active_states:
+                break
+
+            active_lengths = {int(state.input_ids.shape[0]) for state in active_states}
+            if len(active_lengths) != 1:
+                raise ValueError(
+                    "Active rollout lengths diverged inside a batch. "
+                    "Replicated prompts should stay aligned after dropping finished rollouts."
+                )
+
+            active_input_ids = torch.stack([state.input_ids for state in active_states], dim=0)
+            hook_specs = []
+            if rule is not None:
+                hook_specs = [
+                    (
+                        f"blocks.{layer_idx}.hook_resid_post",
+                        make_batched_residual_steering_hook(layer_idx, rule, active_states),
+                    )
+                    for layer_idx in rule.layers
+                ]
+
+            with model.hooks(fwd_hooks=hook_specs):
+                logits = model(active_input_ids, return_type="logits")
+
+            if not isinstance(logits, torch.Tensor):
+                raise TypeError("Model forward pass must return torch.Tensor logits.")
+            if logits.ndim != 3:
+                raise ValueError(f"Expected logits to have shape [batch, pos, vocab], got {tuple(logits.shape)}")
+
+            next_tokens = sample_next_token(
+                logits=logits[:, -1, :],
+                temperature=temperature,
+                top_p=top_p,
+                top_k=top_k,
+            ).squeeze(-1)
+
+            for batch_idx, state in enumerate(active_states):
+                next_token = next_tokens[batch_idx : batch_idx + 1].to(device=state.input_ids.device)
+                token_id = int(next_token.item())
+                state.generated_ids.append(token_id)
+                state.input_ids = torch.cat((state.input_ids, next_token), dim=0)
+
+                token_text = model.tokenizer.decode([token_id], skip_special_tokens=True)
+                previous_chunk_count = state.context.num_chunks_generated
+                state.context.feed(token_text)
+                if state.context.num_chunks_generated > previous_chunk_count:
+                    state.chunk_transitions.append(
+                        {
+                            "completion_tokens_after_feed": len(state.generated_ids),
+                            "num_chunks_generated": state.context.num_chunks_generated,
+                            "chunk_idx_scaled": float(state.context.chunk_idx_scaled),
+                        }
+                    )
+                if has_complete_boxed_answer(state.context.generated_text):
+                    state.finish_reason = "boxed_answer"
+                    state.is_finished = True
+
+    return [build_rollout_result(model=model, state=state, rule=rule) for state in states]
+
+
+def generate_steered(
+    model: Any,
+    prompt: str,
+    rule: Optional[SteeringRule],
+    max_tokens: int,
+    temperature: float,
+    top_p: float,
+    top_k: Optional[int],
+) -> Dict[str, Any]:
+    return generate_steered_batch(
+        model=model,
+        prompt=prompt,
+        prompt_tokens=model.to_tokens(prompt),
+        batch_size=1,
+        rule=rule,
+        max_tokens=max_tokens,
+        temperature=temperature,
+        top_p=top_p,
+        top_k=top_k,
+    )[0]
 
 
 def load_local_model(args: argparse.Namespace) -> Any:
@@ -675,43 +765,42 @@ def process_problem_dir(
         return
 
     prompt = rollout_prompt(problem)
+    prompt_tokens = model.to_tokens(prompt)
     new_solutions = []
-    for _ in tqdm(range(needed), desc=f"problem_{problem_id} rollouts", leave=False):
-        # try:
-        
-        result = generate_steered(
+    progress = tqdm(total=needed, desc=f"problem_{problem_id} rollouts", leave=False)
+    while len(new_solutions) < needed:
+        current_batch_size = min(args.batch_size, needed - len(new_solutions))
+        batch_results = generate_steered_batch(
             model=model,
             prompt=prompt,
+            prompt_tokens=prompt_tokens,
+            batch_size=current_batch_size,
             rule=rule,
             max_tokens=args.max_tokens,
             temperature=args.temperature,
             top_p=args.top_p,
             top_k=args.top_k,
         )
-        rollout_text = result["text"]
-        extracted_answers = extract_boxed_answers(rollout_text)
-        answer = extracted_answers[0] if extracted_answers else ""
-        is_correct = bool(problem.get("gt_answer") and answer and check_answer(answer, problem["gt_answer"]))
+        for result in batch_results:
+            rollout_text = result["text"]
+            extracted_answers = extract_boxed_answers(rollout_text)
+            answer = extracted_answers[0] if extracted_answers else ""
+            is_correct = bool(problem.get("gt_answer") and answer and check_answer(answer, problem["gt_answer"]))
 
-        new_solutions.append(
-            {
-                "prompt": prompt,
-                "rollout": rollout_text,
-                "full_cot": f"{prompt}{rollout_text}",
-                "answer": answer,
-                "is_correct": is_correct,
-                "steered_chunks": result["chunk_context"]["chunks"],
-                "chunk_context": result["chunk_context"],
-                "steering_debug": result["steering_debug"],
-            }
-        )
-        # except Exception as exc:
-        #     new_solutions.append(
-        #         {
-        #             "prompt": prompt,
-        #             "error": str(exc),
-        #         }
-        #     )
+            new_solutions.append(
+                {
+                    "prompt": prompt,
+                    "rollout": rollout_text,
+                    "full_cot": f"{prompt}{rollout_text}",
+                    "answer": answer,
+                    "is_correct": is_correct,
+                    "steered_chunks": result["chunk_context"]["chunks"],
+                    "chunk_context": result["chunk_context"],
+                    "steering_debug": result["steering_debug"],
+                }
+            )
+        progress.update(len(batch_results))
+    progress.close()
 
     write_json(solutions_file, existing_solutions + new_solutions)
 
@@ -749,6 +838,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("-n", "--strength_n", type=float, default=3.0)
     parser.add_argument("-nr", "--num_rollouts", type=int, default=100)
+    parser.add_argument("-bs", "--batch_size", type=int, default=1)
     parser.add_argument("-t", "--temperature", type=float, default=0.6)
     parser.add_argument("-tp", "--top_p", type=float, default=0.95)
     parser.add_argument("-tk", "--top_k", type=int, default=None)
@@ -762,6 +852,12 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
+    if args.num_rollouts <= 0:
+        raise ValueError("--num_rollouts must be a positive integer.")
+    if args.batch_size <= 0:
+        raise ValueError("--batch_size must be a positive integer.")
+    args.batch_size = min(args.batch_size, args.num_rollouts)
+
     random.seed(args.seed)
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
