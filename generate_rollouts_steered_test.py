@@ -837,6 +837,7 @@ def process_problem_dir(
                 }
             )
         progress.update(len(batch_results))
+        write_json(solutions_file, existing_solutions + new_solutions)
     progress.close()
 
     write_json(solutions_file, existing_solutions + new_solutions)

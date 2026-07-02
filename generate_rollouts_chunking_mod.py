@@ -9,6 +9,15 @@ from tqdm import tqdm
 from pathlib import Path
 from typing import List, Dict
 from dotenv import load_dotenv
+from openai import OpenAI
+from prompts import DAG_PROMPT
+from chunking_mod import (
+    load_json,
+    materialize_merged_chunks,
+    merge_consecutive_labeled_chunks,
+    resolve_chunk_dir,
+    write_json,
+)
 from utils import extract_boxed_answers, check_answer, split_solution_into_chunks, load_math_problems
 from transformers import TextStreamer
 
@@ -22,6 +31,7 @@ NOVITA_API_KEY = os.getenv("NOVITA_API_KEY")
 TOGETHER_API_KEY = os.getenv("TOGETHER_API_KEY")
 FIREWORKS_API_KEY = os.getenv("FIREWORKS_API_KEY")
 HF_KEY = os.getenv("HF_TOKEN")
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 
 # "deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B"
 
@@ -61,6 +71,8 @@ parser.add_argument('-mr', '--max_retries', type=int, default=1, help='Maximum n
 parser.add_argument('-os', '--output_suffix', type=str, default=None, help='Suffix to add to the output directory')
 
 args = parser.parse_args()
+
+client = OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
 
 # Create output directory
 base_output_dir = Path(args.output_dir) / args.model.split(":")[0] / f"temperature_{str(args.temperature)}_top_p_{str(args.top_p)}"
@@ -142,6 +154,87 @@ if args.provider == "Local":
     except Exception as e:
         print(f"Error loading local model: {e}")
         exit(1)
+
+
+def label_chunks(problem_text: str, chunks: List[str]) -> List[Dict]:
+    if not chunks:
+        return []
+
+    if not client:
+        raise ValueError("OPENAI_API_KEY not found in environment; cannot label intermediate chunks.")
+
+    full_chunked_text = ""
+    for i, chunk in enumerate(chunks):
+        full_chunked_text += f"Chunk {i}:\n{chunk}\n\n"
+
+    formatted_prompt = DAG_PROMPT.format(
+        problem_text=problem_text, full_chunked_text=full_chunked_text
+    )
+
+    response = client.chat.completions.create(
+        model="gpt-4o",
+        messages=[{"role": "user", "content": formatted_prompt}],
+        temperature=0.0,
+        response_format={"type": "json_object"},
+    )
+    raw_result = json.loads(response.choices[0].message.content)
+
+    labeled_chunks = []
+    for idx, chunk in enumerate(chunks):
+        chunk_mapping = raw_result.get(str(idx), {})
+        labeled_chunks.append(
+            {
+                "chunk": chunk,
+                "chunk_idx": idx,
+                "function_tags": chunk_mapping.get(
+                    "function_tags", ["unknown"]
+                ),
+                "depends_on": chunk_mapping.get("depends_on", []),
+            }
+        )
+
+    return labeled_chunks
+
+
+def label_and_merge_chunks(
+    problem_text: str,
+    chunks: List[str],
+    problem_dir: Path = None,
+    chunks_payload: Dict = None,
+    labeled_chunks_file: Path = None,
+    use_cached_labels: bool = False,
+) -> List[Dict]:
+    if not chunks:
+        return []
+
+    if (
+        use_cached_labels
+        and labeled_chunks_file is not None
+        and labeled_chunks_file.exists()
+        and not args.force
+    ):
+        labeled_chunks = load_json(labeled_chunks_file)
+        print(
+            f"Loaded {len(labeled_chunks)} intermediate labeled chunks from {labeled_chunks_file}"
+        )
+    else:
+        labeled_chunks = label_chunks(problem_text, chunks)
+        if labeled_chunks_file is not None:
+            write_json(labeled_chunks_file, labeled_chunks)
+            print(
+                f"Saved intermediate chunk labels to {labeled_chunks_file}"
+            )
+
+    if problem_dir is not None and chunks_payload is not None:
+        mod_artifacts = materialize_merged_chunks(
+            problem_dir,
+            labeled_chunks=labeled_chunks,
+            chunks_payload=chunks_payload,
+        )
+        return mod_artifacts["merged_chunks"]
+
+    merged_chunks, _ = merge_consecutive_labeled_chunks(labeled_chunks)
+    return merged_chunks
 
 def generate_with_local_model(prompt: str, temperature: float, top_p: float, max_tokens: int) -> Dict:
     """Generate text using a local model."""
@@ -260,9 +353,9 @@ async def make_api_request(prompt_dict: Dict, temperature: float, top_p: float, 
             "Authorization": f"Bearer {NOVITA_API_KEY}",
             "Content-Type": "application/json"
         }
-        
+
         payload = {
-            "model": args.model,
+            "model": "deepseek-ai/DeepSeek-R1-Distill-Qwen-14B:de-85e4d5ac963eed7e",#"deepseek-ai/DeepSeek-R1-Distill-Qwen-14B:de-bff1d93a6824e911",
             # "prompt": prompt,
             "temperature": temperature,
             "top_p": top_p,
@@ -271,7 +364,7 @@ async def make_api_request(prompt_dict: Dict, temperature: float, top_p: float, 
             "stream": False
         }
         
-        api_url = "https://api.novita.ai/dedicated/v1/openai"#"https://api.novita.ai/dedicated/v1/openai/completions"#"https://api.novita.ai/v3/openai/completions"
+        api_url ="https://api.novita.ai/dedicated/v1/openai"#"https://api.novita.ai/dedicated/v1/openai/completions"#"https://api.novita.ai/v3/openai/completions"
         
     elif args.provider == "Together":
         # Together API request
@@ -282,7 +375,7 @@ async def make_api_request(prompt_dict: Dict, temperature: float, top_p: float, 
         }
         
         payload = {
-            "model": args.model if args.model else "deepseek-ai/deepseek-r1-distill-qwen-14b",
+            "model": "deepseek-ai/DeepSeek-R1-Distill-Qwen-14B:de-bff1d93a6824e911",
             # "prompt": prompt,
             "temperature": temperature,
             "top_p": top_p,
@@ -594,10 +687,11 @@ async def generate_base_solution(problem_dict: Dict, temperature: float = 0.6) -
                     print(f"GT answer: {problem_dict[problem_idx].get('gt_answer')}")
                     if problem_dict[problem_idx].get('gt_answer') and answer:
                         is_correct = check_answer(answer, problem_dict[problem_idx]['gt_answer'])
+                        print(f"Answer is correct? :- {is_correct}")
                     response_dict[problem_idx] = {}
                     response_dict[problem_idx]['prompt'] = prompt_dict[problem_idx]
-                    response_dict[problem_idx]['solution'] = solution_text
-                    response_dict[problem_idx]['full_cot'] = prompt_dict[problem_idx] + solution_text
+                    response_dict[problem_idx]['solution'] = solution_text.replace("Ġ", " ").replace("Ċ", "\n")
+                    response_dict[problem_idx]['full_cot'] = prompt_dict[problem_idx] + solution_text.replace("Ġ", " ").replace("Ċ", "\n")
                     response_dict[problem_idx]['answer'] = answer
                     response_dict[problem_idx]['is_correct'] = is_correct
                 except Exception as e:
@@ -621,22 +715,25 @@ async def generate_base_solution(problem_dict: Dict, temperature: float = 0.6) -
                     "error": str(e)
                 }
 
-async def generate_rollouts(problem: Dict, chunk_text: str, full_cot_prefix: str, temperature: float = 0.7, rollout_type: str = 'default') -> Dict:
+async def generate_rollouts(
+    problem: Dict,
+    chunk_text: str,
+    prefix_without_chunk: str,
+    temperature: float = 0.7,
+    rollout_type: str = 'default',
+) -> Dict:
     """
     Generate a rollout by removing a specific chunk and regenerating from that point.
     
     Args:
         problem: Problem dictionary
         chunk_text: Text of the current chunk to remove
-        full_cot_prefix: Full CoT text up to and including the current chunk
+        prefix_without_chunk: Full CoT prefix before the removed merged chunk
         temperature: Temperature for generation
         rollout_type: Type of rollout to generate
     Returns:
         Dictionary with the rollout result
     """
-    # Remove the current chunk from the prefix to see how it gets regenerated
-    prefix_without_chunk = full_cot_prefix.replace(chunk_text, "").strip()
-    
     # Create prompt with the prefix without the current chunk
     prompt = f"Solve this math problem step by step. You MUST put your final answer in \\boxed{{}}. Problem: {problem['problem']} Solution: \n<think>\n{prefix_without_chunk}"
     
@@ -652,8 +749,17 @@ async def generate_rollouts(problem: Dict, chunk_text: str, full_cot_prefix: str
             response_dict = await make_api_request(prompt_dict, temperature, args.top_p, args.max_tokens)
             responses = {}
             for idx, response in response_dict.items():    
-                rollout_text = response['text']
-                chunk_resampled = split_solution_into_chunks(rollout_text)[0]
+                rollout_text = response['text'].replace("Ġ", " ").replace("Ċ", "\n")
+                rollout_chunks = split_solution_into_chunks(rollout_text)
+                merged_rollout_chunks = label_and_merge_chunks(
+                    problem['problem'], rollout_chunks
+                )
+                
+                chunk_resampled = (
+                    merged_rollout_chunks[0]["chunk"]
+                    if merged_rollout_chunks
+                    else ""
+                )
                 
                 # Extract answer and check correctness
                 extracted_answers = extract_boxed_answers(f"{prompt}{rollout_text}" if rollout_type == 'forced_answer' else rollout_text)
@@ -685,7 +791,6 @@ async def generate_rollouts(problem: Dict, chunk_text: str, full_cot_prefix: str
                     "chunk_removed": chunk_text,
                     "prefix_without_chunk": prefix_without_chunk,
                     "error": str(e),
-                    "response":response
                 }}
 
 async def process_problems(problem_dict: Dict) -> None:
@@ -746,7 +851,7 @@ async def process_problems(problem_dict: Dict) -> None:
         if base_solution is not None: # and "error" not in base_solution:
             del problem_dict_working[problem_idx]
             base_solution_dict[problem_idx]['base_solution'] = base_solution
-            
+
     base_solution_response_dict = {problem_idx:base_solution_dict[problem_idx]['base_solution'] 
                                    for problem_idx in base_solution_dict 
                                    if problem_idx not in problem_dict_working}
@@ -756,25 +861,36 @@ async def process_problems(problem_dict: Dict) -> None:
         print(f"Problems {list(problem_dict_working.keys())}: Generating {args.base_solution_type} base solution")
         new_base_solutions = await generate_base_solution(problem_dict_working, args.temperature)
         base_solution_response_dict.update(new_base_solutions)
-        # if args.base_solution_type == "correct" and ("is_correct" not in base_solution or not base_solution["is_correct"]):
-        #     print(base_solution["solution"])
-        #     print(f"Problem {problem_idx}: Base solution is INCORRECT or has error. Retrying...")
-        #     return await process_problems(problem_idx, problem)
-        # elif args.base_solution_type == "incorrect" and ("is_correct" not in base_solution or base_solution["is_correct"]):
-        #     print(base_solution["solution"])
-        #     print(f"Problem {problem_idx}: Base solution is CORRECT or has error. Retrying...")
-        #     return await process_problems(problem_idx, problem)
+        if args.base_solution_type == "correct":
+            retry_problem_dict = {id:problem for id,problem in problem_dict_working.items() if "is_correct" not in base_solution_response_dict[id] or not base_solution_response_dict[id]["is_correct"]}
+            if retry_problem_dict:
+                # retried_base_solutions = await generate_base_solution(problem_dict_working, args.temperature)
+                print(f"Problem {list(retry_problem_dict.keys())}: Base solution is INCORRECT or has error. Retrying...")
+                base_solution_response_dict = {id:response for id,response in base_solution_response_dict.items() if id not in retry_problem_dict.keys()}
+                return await process_problems(retry_problem_dict)
+            # print(base_solution["solution"])
+            
+        elif args.base_solution_type == "incorrect":
+            retry_problem_dict = {id:problem for id,problem in problem_dict_working.items() if "is_correct" not in base_solution_response_dict[id] or base_solution_response_dict[id]["is_correct"]}
+            if retry_problem_dict:
+                # retried_base_solutions = await generate_base_solution(problem_dict_working, args.temperature)
+                print(f"Problem {list(retry_problem_dict.keys())}: Base solution is CORRECT or has error. Retrying...")
+                base_solution_response_dict = {id:response for id,response in base_solution_response_dict.items() if id not in retry_problem_dict.keys()}
+                return await process_problems(retry_problem_dict)
     
     for problem_idx, base_solution_response in tqdm(base_solution_response_dict.items()):
         # Save base solution
         problem_dir = output_dir / f"problem_{problem_idx}"
+        
         with open(base_solution_dict[problem_idx]['base_solution_file'], 'w', encoding='utf-8') as f:
             json.dump(base_solution_response, f, indent=2)
         
         # Get the source text for chunking
         source_text = base_solution_response["full_cot"]
         # print(f"Problem {problem_idx}: Using full CoT for chunking")
-        print(f"Base solution full COT for problem {problem_idx}:\n{source_text}\n")
+        
+        print(f"Source text for problem {problem_idx}:\n{source_text}\n")
+        
         # Extract the solution part for chunking
         if "<think>" in source_text:
             solution_text = source_text.split("<think>")[1].strip()
@@ -782,6 +898,10 @@ async def process_problems(problem_dict: Dict) -> None:
                 solution_text = solution_text.split("</think>")[0].strip()
         else:
             solution_text = source_text
+        
+        # solution_text = solution_text.replace("Ġ", " ").replace("Ċ", "\n")
+        
+        
         
         # Save chunks to a separate file
         chunks_file = problem_dir / "chunks.json"
@@ -798,7 +918,24 @@ async def process_problems(problem_dict: Dict) -> None:
             with open(chunks_file, 'r', encoding='utf-8') as f:
                 chunks = json.load(f)['chunks']
             print(f"Problem {problem_idx}: Loaded {len(chunks)} existing chunks")
-        
+
+        labeled_chunks_file = problem_dir / "chunks_labeled.json"
+        merged_chunks = label_and_merge_chunks(
+            problem['problem'],
+            chunks,
+            problem_dir,
+            chunks_payload={
+                "source_text": source_text,
+                "solution_text": solution_text,
+                "chunks": chunks,
+            },
+            labeled_chunks_file=labeled_chunks_file,
+            use_cached_labels=True,
+        )
+        print(
+            f"Problem {problem_idx}: Merged {len(chunks)} intermediate chunks into {len(merged_chunks)} rollout chunks"
+        )
+
         # if len(chunks) > args.max_chunks:
         #     print(f"Problem {problem_idx}: Too many chunks. Will not generate rollouts.")
         #     return
@@ -806,20 +943,31 @@ async def process_problems(problem_dict: Dict) -> None:
         # Build cumulative chunks for proper continuation
         cumulative_chunks = []
         current_cumulative = ""
-        n_chunks = len(chunks) if args.n_chunks_rollout is None else args.n_chunks_rollout
-        for chunk in chunks[:n_chunks]:
-            current_cumulative += chunk + " "
+        n_chunks = (
+            len(merged_chunks)
+            if args.n_chunks_rollout is None
+            else min(args.n_chunks_rollout, len(merged_chunks))
+        )
+        for merged_chunk in merged_chunks[:n_chunks]:
+            current_cumulative += merged_chunk["chunk"] + " "
             cumulative_chunks.append(current_cumulative.strip())
         
         # Process each chunk
-        for chunk_idx, (chunk, full_prefix) in enumerate(zip(chunks, cumulative_chunks)):           ## NO OF CHUNKS TO GENERATE FOR !!
+        for chunk_idx, merged_chunk in enumerate(merged_chunks[:n_chunks]):           ## NO OF CHUNKS TO GENERATE FOR !!
+            chunk = merged_chunk["chunk"]
+            prefix_without_chunk = (
+                cumulative_chunks[chunk_idx - 1] if chunk_idx > 0 else ""
+            )
 
             if args.include_chunks and str(chunk_idx) not in args.include_chunks.split(","):
                 print(f"Problem {problem_idx}, Chunk {chunk_idx}: Skipping (not in include_chunks)")
                 continue
             
-            chunk_dir = problem_dir / f"chunk_{chunk_idx}"
+            chunk_dir = resolve_chunk_dir(
+                problem_dir, chunk_idx, use_mod_chunks=True
+            )
             chunk_dir.mkdir(exist_ok=True, parents=True)
+            write_json(chunk_dir / "chunk.json", merged_chunk)
             
             # Check if solutions already exist
             solutions_file = chunk_dir / "solutions.json"
@@ -869,9 +1017,6 @@ async def process_problems(problem_dict: Dict) -> None:
                     # Create prompts for all rollouts
                     prompts = []
                     for _ in tqdm(range(num_rollouts_needed), desc="Generating rollouts"):
-                        # Remove the current chunk from the prefix to see how it gets regenerated
-                        prefix_without_chunk = full_prefix.replace(chunk, "").strip()
-                        
                         # Create prompt with the prefix without the current chunk
                         prompt = f"Solve this math problem step by step. You MUST put your final answer in \\boxed{{}}. Problem: {problem['problem']} Solution: \n<think>\n{prefix_without_chunk}"
                         
@@ -894,8 +1039,17 @@ async def process_problems(problem_dict: Dict) -> None:
                             continue
                         
                         # Create the rollout object
-                        prefix_without_chunk = full_prefix.replace(chunk, "").strip()
-                        chunk_resampled = split_solution_into_chunks(rollout_text)[0] if rollout_text else ""
+                        rollout_chunks = split_solution_into_chunks(
+                            rollout_text
+                        )
+                        merged_rollout_chunks = label_and_merge_chunks(
+                            problem['problem'], rollout_chunks
+                        )
+                        chunk_resampled = (
+                            merged_rollout_chunks[0]["chunk"]
+                            if merged_rollout_chunks
+                            else ""
+                        )
                         
                         # Extract answer and check correctness
                         prompt = prompts[i]
@@ -913,13 +1067,23 @@ async def process_problems(problem_dict: Dict) -> None:
                             "rollout": rollout_text,
                             "full_cot": f"{prompt}{rollout_text}",
                             "answer": answer,
-                            "is_correct": is_correct
+                            "is_correct": is_correct,
+                            "function_tags": merged_chunk["function_tags"],
                         })
                 else:
                     # For API providers, we can generate in parallel
-                    # tasks = [generate_rollouts(problem_dict_working[problem_idx], chunk, full_prefix, args.temperature, args.rollout_type) for _ in range(num_rollouts_needed)]
-                    new_solutions_dict = await generate_rollouts(problem_dict[problem_idx], chunk, full_prefix, args.temperature, args.rollout_type)
+                    new_solutions_dict = await generate_rollouts(
+                        problem_dict[problem_idx],
+                        chunk,
+                        prefix_without_chunk,
+                        args.temperature,
+                        args.rollout_type,
+                    )
                     new_solutions = list(new_solutions_dict.values())
+                for sol in new_solutions:
+                    sol.setdefault(
+                        "function_tags", merged_chunk["function_tags"]
+                    )
                 for sol in new_solutions:
                     if 'error' in sol.keys():
                         print(sol)
@@ -940,7 +1104,15 @@ async def process_problems(problem_dict: Dict) -> None:
 async def main():
     """Main function to run the script."""
     # Load problems
-    problems = load_math_problems(problem_type=args.type, level=args.level, num_problems=args.num_problems, split=args.split, include_problems=args.include_problems,
+    include_problems = None
+
+    if args.include_problems:
+        include_problems = [
+            int(problem_id.strip())
+            for problem_id in args.include_problems.split(",")
+            if problem_id.strip()
+        ]
+    problems = load_math_problems(problem_type=args.type, level=args.level, num_problems=args.num_problems, split=args.split, include_problems=include_problems,
                                   hf_key = HF_KEY)
     
     if args.exclude_problems:
@@ -950,19 +1122,23 @@ async def main():
     # if args.include_problems:
     #     include_problems = [int(id) for id in args.include_problems.split(",")]
     #     problems = [problem for problem in problems if problem[0] in include_problems]
-    if args.include_problems:
-        include_problems = {
-            problem_id.strip()
-            for problem_id in args.include_problems.split(",")
-            if problem_id.strip()
-        }
+    # print("sample problem[0]:", problems, type(problems))
+    # if args.include_problems:
+    #     include_problems = {
+    #         problem_id.strip()
+    #         for problem_id in args.include_problems.split(",")
+    #         if problem_id.strip()
+    #     }
 
-        problems = [
-            problem
-            for problem in problems
-            if str(problem[0]) in include_problems
-        ]
-    
+    #     problems = [
+    #         problem
+    #         for problem in problems
+    #         if str(problem[0]) in include_problems
+    #     ]
+    # print("args.include_problems:", args.include_problems, type(args.include_problems))
+    # print("include_problems:", include_problems, type(next(iter(include_problems))))
+    # print("sample problem[0]:", problems, type(problems))
+        
     if not problems:
         print(f"No problems loaded. Exiting.")
         exit(1)

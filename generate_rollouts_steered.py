@@ -14,6 +14,7 @@ import torch
 from dotenv import load_dotenv
 from tqdm import tqdm
 
+from chunking_mod import materialize_merged_chunks
 from utils import check_answer, extract_boxed_answers, load_math_problems
 
 
@@ -26,6 +27,13 @@ DEFAULT_MODEL = "deepseek-ai/DeepSeek-R1-Distill-Qwen-14B"
 DEFAULT_OUTPUT_DIR = (
     SCRIPT_DIR
     / "math_rollouts_steered"
+    / "deepseek-r1-distill-qwen-14b"
+    / "temperature_0.6_top_p_0.95"
+    / "correct_base_solution"
+)
+DEFAULT_CHUNKING_SOURCE_DIR = (
+    SCRIPT_DIR
+    / "math_rollouts"
     / "deepseek-r1-distill-qwen-14b"
     / "temperature_0.6_top_p_0.95"
     / "correct_base_solution"
@@ -847,6 +855,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--model", type=str, default=DEFAULT_MODEL)
     parser.add_argument("--output_dir", type=Path, default=DEFAULT_OUTPUT_DIR)
     parser.add_argument(
+        "--chunking_source_dir",
+        type=Path,
+        default=DEFAULT_CHUNKING_SOURCE_DIR,
+        help="Base rollout directory whose intermediate chunks should be merged into *_mod artifacts before steered generation.",
+    )
+    parser.add_argument(
         "--split",
         type=str,
         default="train",
@@ -884,6 +898,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("-f", "--force", action="store_true")
     parser.add_argument("-ip", "--include_problems", type=str, default=None)
     parser.add_argument("-q", "--quantize", action="store_true")
+    parser.add_argument(
+        "--skip_chunking_mod_materialization",
+        action="store_true",
+        help="Skip preparing merged-by-function-tag chunk artifacts in chunking_source_dir.",
+    )
     return parser.parse_args()
 
 
@@ -938,6 +957,22 @@ def main() -> None:
         raise KeyError(
             f"Failed to load these problem IDs from Hugging Face split {args.split!r}: {missing_problem_ids}"
         )
+
+    if (
+        not args.skip_chunking_mod_materialization
+        and args.chunking_source_dir.exists()
+    ):
+        for problem_dir in problem_dirs:
+            source_problem_dir = args.chunking_source_dir / problem_dir.name
+            if not source_problem_dir.exists():
+                continue
+            try:
+                materialize_merged_chunks(source_problem_dir)
+                print(
+                    f"Prepared merged chunk artifacts for {source_problem_dir.name}"
+                )
+            except FileNotFoundError:
+                continue
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
     print(f"Writing steered rollouts to: {args.output_dir}")

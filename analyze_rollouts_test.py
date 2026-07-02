@@ -1611,7 +1611,7 @@ def analyze_problem(
         try:
             batch_embeddings = embedding_model.encode(
                 [
-                    f"Following statements is from a math solution :- {chunk}"
+                    f"Following statements are from a math solution :- {chunk}"
                     for chunk in batch
                 ],
                 batch_size=batch_size,

@@ -453,6 +453,7 @@ def load_math_problems(
     num_problems: Optional[int] = None,
     split: str = "train",
     include_problems: Optional[List[int]] = None,
+    exclude_problems: Optional[List[int]] = None,
     hf_key: Optional[str] = None,
 ) -> List[Tuple[int, Dict]]:
     """
@@ -505,7 +506,17 @@ def load_math_problems(
             indexed_problems = [
                 (i, problem) for i, problem in indexed_problems if problem.get("level") == level
             ]
-
+            
+        if exclude_problems is not None:
+            indexed_problems = [
+                (i, problem) for i, problem in indexed_problems if problem.get("problem") not in exclude_problems
+            ]
+            
+        if include_problems is not None:
+            indexed_problems = [
+                (i, problem) for i, problem in indexed_problems if i in include_problems
+            ]
+            
         # Sample if needed
         if (
             num_problems is not None
@@ -513,7 +524,7 @@ def load_math_problems(
             and num_problems < len(indexed_problems)
         ):
             indexed_problems = random.sample(indexed_problems, num_problems)
-
+        
         if level:
             print(f"Filtered to level: {level}")
         if problem_type:
