@@ -7,7 +7,7 @@ import asyncio
 import httpx
 from tqdm import tqdm
 from pathlib import Path
-from typing import List, Dict
+from typing import Callable, Dict, List, Optional
 from dotenv import load_dotenv
 from openai import OpenAI
 from prompts import DAG_PROMPT
@@ -282,15 +282,128 @@ def generate_with_local_model(prompt: str, temperature: float, top_p: float, max
         print(f"Error in local generation: {e}")
         return {"error": str(e)}
 
-def generate_with_local_model_batch(prompts: List[str], temperature: float, top_p: float, max_tokens: int) -> List[Dict]:
+def normalize_generated_text(text: str) -> str:
+    return text.replace("\u0120", " ").replace("\u010A", "\n").replace(
+        "\u00C4\u00A0", " "
+    ).replace("\u00C4\u0160", "\n")
+
+def build_base_solution_record(
+    problem_idx: int,
+    response: Dict,
+    prompt: str,
+    problem: Dict,
+) -> Dict:
+    try:
+        solution_text = response["text"]
+        solution_text = normalize_generated_text(solution_text)
+
+        extracted_answers = extract_boxed_answers(solution_text)
+        answer = extracted_answers[0] if extracted_answers else ""
+        is_correct = False
+        print(f"Generated base solution answer: {answer}")
+        print(f"GT answer: {problem.get('gt_answer')}")
+        if problem.get("gt_answer") and answer:
+            is_correct = check_answer(answer, problem["gt_answer"])
+            print(f"Answer is correct? :- {is_correct}")
+
+        cleaned_solution = solution_text
+        cleaned_solution = normalize_generated_text(cleaned_solution)
+        return {
+            "prompt": prompt,
+            "solution": cleaned_solution,
+            "full_cot": prompt + cleaned_solution,
+            "answer": answer,
+            "is_correct": is_correct,
+        }
+    except Exception as e:
+        print(f"Error processing response for problem {problem_idx}: {e}")
+        return {
+            "prompt": prompt,
+            "solution": f"Error: {str(e)}",
+            "error": str(e),
+        }
+
+
+def base_solution_matches_requested_type(base_solution: Dict) -> bool:
+    if not base_solution or "is_correct" not in base_solution:
+        return False
+    if args.base_solution_type == "correct":
+        return bool(base_solution["is_correct"])
+    if args.base_solution_type == "incorrect":
+        return not bool(base_solution["is_correct"])
+    return True
+
+
+def build_rollout_solution_record(
+    problem: Dict,
+    prompt: str,
+    response: Dict,
+    chunk_text: str,
+    prefix_without_chunk: str,
+    function_tags: List[str],
+    rollout_type: str,
+) -> Dict:
+    if "error" in response:
+        return {
+            "chunk_removed": chunk_text,
+            "prefix_without_chunk": prefix_without_chunk,
+            "error": response["error"],
+            "function_tags": function_tags,
+        }
+
+    rollout_text = response["text"]
+    rollout_text = normalize_generated_text(rollout_text)
+    rollout_chunks = split_solution_into_chunks(rollout_text)
+    merged_rollout_chunks = label_and_merge_chunks(
+        problem["problem"], rollout_chunks
+    )
+    chunk_resampled = (
+        merged_rollout_chunks[0]["chunk"]
+        if merged_rollout_chunks
+        else ""
+    )
+
+    extracted_answers = extract_boxed_answers(
+        f"{prompt}{rollout_text}"
+        if rollout_type == "forced_answer"
+        else rollout_text
+    )
+    answer = extracted_answers[0] if extracted_answers else ""
+    is_correct = False
+
+    if problem.get("gt_answer") and answer:
+        is_correct = check_answer(answer, problem["gt_answer"])
+
+    return {
+        "chunk_removed": chunk_text,
+        "prefix_without_chunk": prefix_without_chunk,
+        "chunk_resampled": chunk_resampled,
+        "rollout": rollout_text,
+        "full_cot": f"{prompt}{rollout_text}",
+        "answer": answer,
+        "is_correct": is_correct,
+        "function_tags": function_tags,
+    }
+
+
+def generate_with_local_model_batch(
+    prompts: List[str],
+    temperature: float,
+    top_p: float,
+    max_tokens: int,
+    prompt_ids: Optional[List[int]] = None,
+    batch_callback: Optional[Callable[[Dict[int, Dict]], None]] = None,
+) -> List[Dict]:
     """Generate text using a local model in batch mode for multiple prompts."""
     try:
         results = []
         batch_size = args.batch_size
+        prompt_ids = prompt_ids or list(range(len(prompts)))
         
         # Process prompts in batches
         for i in range(0, len(prompts), batch_size):
             batch_prompts = prompts[i:i+batch_size]
+            batch_prompt_ids = prompt_ids[i:i+batch_size]
             print(f"Processing batch {i//batch_size + 1}/{(len(prompts) + batch_size - 1)//batch_size}")
             
             # Tokenize all prompts in the batch
@@ -321,30 +434,56 @@ def generate_with_local_model_batch(prompts: List[str], temperature: float, top_
                 batch_outputs = local_model.generate(**batch_inputs, **generation_config)
             
             # Process each output in the batch
+            batch_results = []
             for j, (input_ids, output_ids) in enumerate(zip(batch_inputs["input_ids"], batch_outputs)):
                 # Find where the generated text starts (after the prompt)
                 input_length = len(input_ids)
                 
                 # Decode the generated text
                 output_text = local_tokenizer.decode(output_ids[input_length:], skip_special_tokens=True)
-                generated_text = output_text.replace("Ġ", " ").replace("Ċ", "\n")
-                
-                results.append({
+                generated_text = normalize_generated_text(output_text)
+                result = {
                     "text": generated_text,
                     "finish_reason": "stop",  # Simplified
                     "usage": {"total_tokens": len(output_ids)}
-                })
+                }
+                batch_results.append(result)
+                results.append(result)
+
+            if batch_callback is not None:
+                batch_callback(
+                    {
+                        prompt_id: result
+                        for prompt_id, result in zip(
+                            batch_prompt_ids, batch_results
+                        )
+                    }
+                )
         
         return results
     except Exception as e:
         print(f"Error in batch generation: {e}")
-        return [{"error": str(e)} for _ in range(len(prompts))]
+        return results + [{"error": str(e)} for _ in range(len(prompts) - len(results))]
 
-async def make_api_request(prompt_dict: Dict, temperature: float, top_p: float, max_tokens: int) -> Dict:
+async def make_api_request(
+    prompt_dict: Dict,
+    temperature: float,
+    top_p: float,
+    max_tokens: int,
+    local_batch_callback: Optional[Callable[[Dict[int, Dict]], None]] = None,
+) -> Dict:
     """Make an API request to either Novita, Together, Fireworks, or use a local model based on provider setting."""
     # If using local model, use synchronous generation
     if args.provider == "Local":
-        batch_outputs = generate_with_local_model_batch(list(prompt_dict.values()), temperature, top_p, max_tokens)
+        prompt_ids = list(prompt_dict.keys())
+        batch_outputs = generate_with_local_model_batch(
+            list(prompt_dict.values()),
+            temperature,
+            top_p,
+            max_tokens,
+            prompt_ids=prompt_ids,
+            batch_callback=local_batch_callback,
+        )
         return {prompt_id: output for prompt_id, output in zip(prompt_dict.keys(), batch_outputs)}
     # Otherwise, use API-based generation
     if args.provider == "Novita":
@@ -646,7 +785,11 @@ async def handle_streaming_response(api_url: str, headers: Dict, payload: Dict) 
         print(f"Exception during streaming: {e}")
         return {"error": f"Streaming exception: {str(e)}"}
 
-async def generate_base_solution(problem_dict: Dict, temperature: float = 0.6) -> Dict:
+async def generate_base_solution(
+    problem_dict: Dict,
+    temperature: float = 0.6,
+    save_callback: Optional[Callable[[int, Dict], None]] = None,
+) -> Dict:
     """
     Generate a base solution for a problem using Novita API.
     
@@ -669,38 +812,38 @@ async def generate_base_solution(problem_dict: Dict, temperature: float = 0.6) -
         if attempt > 0:
             print(f"Retrying base solution generation (attempt {attempt+1}/{max_retries})...")
         try:
-            responses = await make_api_request(prompt_dict, temperature, args.top_p, args.max_tokens)
             response_dict = {}
 
-            # Now responses is {id: response_obj}
-            for problem_idx, response in responses.items():
-                try:
-                    solution_text = response['text']
-                    # print(f"Base solution generation response: {response}")
-                    solution_text = response['text']
-                    
-                    # Extract answer and check correctness
-                    extracted_answers = extract_boxed_answers(solution_text)
-                    answer = extracted_answers[0] if extracted_answers else ""
-                    is_correct = False
-                    print(f"Generated base solution answer: {answer}")
-                    print(f"GT answer: {problem_dict[problem_idx].get('gt_answer')}")
-                    if problem_dict[problem_idx].get('gt_answer') and answer:
-                        is_correct = check_answer(answer, problem_dict[problem_idx]['gt_answer'])
-                        print(f"Answer is correct? :- {is_correct}")
-                    response_dict[problem_idx] = {}
-                    response_dict[problem_idx]['prompt'] = prompt_dict[problem_idx]
-                    response_dict[problem_idx]['solution'] = solution_text.replace("Ġ", " ").replace("Ċ", "\n")
-                    response_dict[problem_idx]['full_cot'] = prompt_dict[problem_idx] + solution_text.replace("Ġ", " ").replace("Ċ", "\n")
-                    response_dict[problem_idx]['answer'] = answer
-                    response_dict[problem_idx]['is_correct'] = is_correct
-                except Exception as e:
-                    print(f"Error processing response for problem {problem_idx}: {e}")
-                    response_dict[problem_idx] = {
-                        "prompt": prompt_dict[problem_idx],
-                        "solution": f"Error: {str(e)}",
-                        "error": str(e)
-                    }
+            def process_response_batch(responses: Dict[int, Dict]) -> None:
+                for problem_idx, response in responses.items():
+                    processed_response = build_base_solution_record(
+                        problem_idx,
+                        response,
+                        prompt_dict[problem_idx],
+                        problem_dict[problem_idx],
+                    )
+                    response_dict[problem_idx] = processed_response
+                    if save_callback is not None:
+                        save_callback(problem_idx, processed_response)
+
+            responses = await make_api_request(
+                prompt_dict,
+                temperature,
+                args.top_p,
+                args.max_tokens,
+                local_batch_callback=process_response_batch
+                if args.provider == "Local"
+                else None,
+            )
+            pending_responses = {
+                problem_idx: response
+                for problem_idx, response in responses.items()
+                if problem_idx not in response_dict
+            }
+            if args.provider != "Local":
+                process_response_batch(responses)
+            elif pending_responses:
+                process_response_batch(pending_responses)
             return response_dict
         except Exception as e:
             print(f"API error: {e}")
@@ -829,25 +972,31 @@ async def process_problems(problem_dict: Dict) -> None:
             except json.JSONDecodeError:
                 print(f"Problem {problem_idx}: Corrupted base_solution.json file. Will regenerate.")
                 base_solution = None
+            
+            if base_solution is not None and not args.skip_recalculate and 'solution' in base_solution:
+                extracted_answers = extract_boxed_answers(base_solution['solution'])
+                answer = extracted_answers[0] if extracted_answers else ""
+                is_correct = False
                 
-                # Recalculate accuracy for base solution if needed
-                if not args.skip_recalculate and 'solution' in base_solution:
-                    extracted_answers = extract_boxed_answers(base_solution['solution'])
-                    answer = extracted_answers[0] if extracted_answers else ""
-                    is_correct = False
+                if problem.get('gt_answer') and answer:
+                    is_correct = check_answer(answer, problem['gt_answer'])
+                
+                # Update if different
+                if base_solution.get('answer') != answer or base_solution.get('is_correct') != is_correct:
+                    print(f"Problem {problem_idx}: Updating base solution accuracy")
+                    base_solution['answer'] = answer
+                    base_solution['is_correct'] = is_correct
                     
-                    if problem.get('gt_answer') and answer:
-                        is_correct = check_answer(answer, problem['gt_answer'])
-                    
-                    # Update if different
-                    if base_solution.get('answer') != answer or base_solution.get('is_correct') != is_correct:
-                        print(f"Problem {problem_idx}: Updating base solution accuracy")
-                        base_solution['answer'] = answer
-                        base_solution['is_correct'] = is_correct
-                        
-                        # Save updated base solution
-                        with open(base_solution_file, 'w', encoding='utf-8') as f:
-                            json.dump(base_solution, f, indent=2)
+                    # Save updated base solution
+                    with open(base_solution_file, 'w', encoding='utf-8') as f:
+                        json.dump(base_solution, f, indent=2)
+
+            if base_solution is not None and not base_solution_matches_requested_type(base_solution):
+                print(
+                    f"Problem {problem_idx}: Existing base solution does not match requested "
+                    f"'{args.base_solution_type}' type. Will regenerate."
+                )
+                base_solution = None
         if base_solution is not None: # and "error" not in base_solution:
             del problem_dict_working[problem_idx]
             base_solution_dict[problem_idx]['base_solution'] = base_solution
@@ -859,7 +1008,17 @@ async def process_problems(problem_dict: Dict) -> None:
     # Generate base solution if needed
     if problem_dict_working:
         print(f"Problems {list(problem_dict_working.keys())}: Generating {args.base_solution_type} base solution")
-        new_base_solutions = await generate_base_solution(problem_dict_working, args.temperature)
+        def save_base_solution(problem_idx: int, base_solution: Dict) -> None:
+            write_json(
+                base_solution_dict[problem_idx]['base_solution_file'],
+                base_solution,
+            )
+
+        new_base_solutions = await generate_base_solution(
+            problem_dict_working,
+            args.temperature,
+            save_callback=save_base_solution if args.provider == "Local" else None,
+        )
         base_solution_response_dict.update(new_base_solutions)
         if args.base_solution_type == "correct":
             retry_problem_dict = {id:problem for id,problem in problem_dict_working.items() if "is_correct" not in base_solution_response_dict[id] or not base_solution_response_dict[id]["is_correct"]}
@@ -1024,52 +1183,47 @@ async def process_problems(problem_dict: Dict) -> None:
                             prompt += "\n</think>\n\nTherefore, the final answers is \\boxed{"
                         
                         prompts.append(prompt)
-                    
-                    # Generate all rollouts in batch
-                    batch_results = generate_with_local_model_batch(prompts, args.temperature, args.top_p, args.max_tokens)
-                    
-                    # Process results
                     new_solutions = []
-                    for i, result in enumerate(batch_results):
-                        rollout_text = result.get('text', '')
-                        
-                        # Skip if there was an error
-                        if 'error' in result:
-                            new_solutions.append({"error": result['error']})
-                            continue
-                        
-                        # Create the rollout object
-                        rollout_chunks = split_solution_into_chunks(
-                            rollout_text
+                    all_solutions = list(existing_solutions)
+
+                    def save_rollout_batch(batch_responses: Dict[int, Dict]) -> None:
+                        batch_solutions = []
+                        for rollout_idx, response in batch_responses.items():
+                            batch_solutions.append(
+                                build_rollout_solution_record(
+                                    problem,
+                                    prompts[rollout_idx],
+                                    response,
+                                    chunk,
+                                    prefix_without_chunk,
+                                    merged_chunk["function_tags"],
+                                    args.rollout_type,
+                                )
+                            )
+                        new_solutions.extend(batch_solutions)
+                        all_solutions.extend(batch_solutions)
+                        write_json(solutions_file, all_solutions)
+                        print(
+                            f"Problem {problem_idx}, Chunk {chunk_idx}: Saved "
+                            f"{len(all_solutions)} solutions after batch"
                         )
-                        merged_rollout_chunks = label_and_merge_chunks(
-                            problem['problem'], rollout_chunks
+
+                    batch_results = generate_with_local_model_batch(
+                        prompts,
+                        args.temperature,
+                        args.top_p,
+                        args.max_tokens,
+                        prompt_ids=list(range(len(prompts))),
+                        batch_callback=save_rollout_batch,
+                    )
+                    if len(new_solutions) < len(prompts):
+                        save_rollout_batch(
+                            {
+                                rollout_idx: response
+                                for rollout_idx, response in enumerate(batch_results)
+                                if rollout_idx >= len(new_solutions)
+                            }
                         )
-                        chunk_resampled = (
-                            merged_rollout_chunks[0]["chunk"]
-                            if merged_rollout_chunks
-                            else ""
-                        )
-                        
-                        # Extract answer and check correctness
-                        prompt = prompts[i]
-                        extracted_answers = extract_boxed_answers(f"{prompt}{rollout_text}" if args.rollout_type == 'forced_answer' else rollout_text)
-                        answer = extracted_answers[0] if extracted_answers else ""
-                        is_correct = False
-                        
-                        if problem.get('gt_answer') and answer:
-                            is_correct = check_answer(answer, problem['gt_answer'])
-                        
-                        new_solutions.append({
-                            "chunk_removed": chunk,
-                            "prefix_without_chunk": prefix_without_chunk,
-                            "chunk_resampled": chunk_resampled,
-                            "rollout": rollout_text,
-                            "full_cot": f"{prompt}{rollout_text}",
-                            "answer": answer,
-                            "is_correct": is_correct,
-                            "function_tags": merged_chunk["function_tags"],
-                        })
                 else:
                     # For API providers, we can generate in parallel
                     new_solutions_dict = await generate_rollouts(
@@ -1089,12 +1243,13 @@ async def process_problems(problem_dict: Dict) -> None:
                         print(sol)
                 
                 # Combine with existing solutions
-                all_solutions = existing_solutions + new_solutions
-                # Save all solutions
-                with open(solutions_file, 'w', encoding='utf-8') as f:
-                    json.dump(all_solutions, f, indent=2)
-                
-                print(f"Problem {problem_idx}, Chunk {chunk_idx}: Saved {len(all_solutions)} solutions")
+                if args.provider != "Local":
+                    all_solutions = existing_solutions + new_solutions
+                    # Save all solutions
+                    with open(solutions_file, 'w', encoding='utf-8') as f:
+                        json.dump(all_solutions, f, indent=2)
+                    
+                    print(f"Problem {problem_idx}, Chunk {chunk_idx}: Saved {len(all_solutions)} solutions")
             else:
                 print(f"Problem {problem_idx}, Chunk {chunk_idx}: Already have {len(valid_existing_solutions)} valid solutions")
     else:
